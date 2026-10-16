@@ -32,6 +32,7 @@ export interface Dispute {
   slaDueDate: Date | null;
   slaWarningSent: boolean;
   internalNotes: string | null;
+  lastAutoEscalatedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -178,6 +179,7 @@ export class DisputeModel {
          sla_due_date    AS "slaDueDate",
          sla_warning_sent AS "slaWarningSent",
          internal_notes  AS "internalNotes",
+         last_auto_escalated_at AS "lastAutoEscalatedAt",
          created_at      AS "createdAt",
          updated_at      AS "updatedAt"`,
       [
@@ -212,6 +214,7 @@ export class DisputeModel {
          sla_due_date    AS "slaDueDate",
          sla_warning_sent AS "slaWarningSent",
          internal_notes  AS "internalNotes",
+         last_auto_escalated_at AS "lastAutoEscalatedAt",
          created_at      AS "createdAt",
          updated_at      AS "updatedAt"
        FROM disputes
@@ -243,6 +246,7 @@ export class DisputeModel {
          sla_due_date    AS "slaDueDate",
          sla_warning_sent AS "slaWarningSent",
          internal_notes  AS "internalNotes",
+         last_auto_escalated_at AS "lastAutoEscalatedAt",
          created_at      AS "createdAt",
          updated_at      AS "updatedAt"
        FROM disputes
@@ -440,6 +444,7 @@ export class DisputeModel {
          sla_due_date    AS "slaDueDate",
          sla_warning_sent AS "slaWarningSent",
          internal_notes  AS "internalNotes",
+         last_auto_escalated_at AS "lastAutoEscalatedAt",
          created_at      AS "createdAt",
          updated_at      AS "updatedAt"
        FROM disputes
@@ -509,6 +514,7 @@ export class DisputeModel {
          sla_due_date    AS "slaDueDate",
          sla_warning_sent AS "slaWarningSent",
          internal_notes  AS "internalNotes",
+         last_auto_escalated_at AS "lastAutoEscalatedAt",
          created_at      AS "createdAt",
          updated_at      AS "updatedAt"`,
       params,
@@ -540,6 +546,7 @@ export class DisputeModel {
          sla_due_date    AS "slaDueDate",
          sla_warning_sent AS "slaWarningSent",
          internal_notes  AS "internalNotes",
+         last_auto_escalated_at AS "lastAutoEscalatedAt",
          created_at      AS "createdAt",
          updated_at      AS "updatedAt"`,
       [disputeId, agentName],
@@ -629,6 +636,7 @@ export class DisputeModel {
          sla_due_date    AS "slaDueDate",
          sla_warning_sent AS "slaWarningSent",
          internal_notes  AS "internalNotes",
+         last_auto_escalated_at AS "lastAutoEscalatedAt",
          created_at      AS "createdAt",
          updated_at      AS "updatedAt"
        FROM disputes
@@ -664,6 +672,7 @@ export class DisputeModel {
          sla_due_date    AS "slaDueDate",
          sla_warning_sent AS "slaWarningSent",
          internal_notes  AS "internalNotes",
+         last_auto_escalated_at AS "lastAutoEscalatedAt",
          created_at      AS "createdAt",
          updated_at      AS "updatedAt"
        FROM disputes
