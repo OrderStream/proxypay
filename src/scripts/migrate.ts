@@ -7,6 +7,7 @@
  * `schema_migrations` table in PostgreSQL.
  *
  * Usage (via npm scripts defined in package.json):
+ *   npm run migrate:preflight – validate pending migrations without writes
  *   npm run migrate:up      – apply all pending migrations
  *   npm run migrate:down    – roll back the last applied migration
  *   npm run migrate:status  – list applied and pending migrations
@@ -38,6 +39,34 @@ const pool = new Pool({
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
 });
+
+const MIGRATION_LOCK_KEYS = [0x50585059, 0x4d494752];
+
+async function withMigrationLock<T>(operation: () => Promise<T>): Promise<T> {
+  const lockClient = await pool.connect();
+  let lockAcquired = false;
+  let releaseError: Error | undefined;
+
+  try {
+    await lockClient.query("SELECT pg_advisory_lock($1, $2)", MIGRATION_LOCK_KEYS);
+    lockAcquired = true;
+    return await operation();
+  } finally {
+    try {
+      if (lockAcquired) {
+        await lockClient.query(
+          "SELECT pg_advisory_unlock($1, $2)",
+          MIGRATION_LOCK_KEYS,
+        );
+      }
+    } catch (error) {
+      releaseError = error instanceof Error ? error : new Error(String(error));
+      throw error;
+    } finally {
+      lockClient.release(releaseError);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Migrations table bootstrap
@@ -165,6 +194,14 @@ async function getAppliedVersions(): Promise<Set<string>> {
   return new Set(result.rows.map((r) => r.version));
 }
 
+async function getAppliedVersionsForPreflight(): Promise<Set<string>> {
+  const result = await pool.query<{ table_exists: boolean }>(
+    "SELECT to_regclass('schema_migrations') IS NOT NULL AS table_exists",
+  );
+  if (!result.rows[0]?.table_exists) return new Set();
+  return getAppliedVersions();
+}
+
 // ---------------------------------------------------------------------------
 // Pre-flight checks
 // ---------------------------------------------------------------------------
@@ -185,7 +222,28 @@ function verifyRollbackSafety(pending: MigrationFile[]): void {
   }
 }
 
+async function migratePreflight(): Promise<void> {
+  const all = discoverMigrations();
+  const applied = await getAppliedVersionsForPreflight();
+  const appliedCanonical = new Set(applied);
+
+  for (const migration of all) {
+    if (applied.has(migration.legacyVersion)) {
+      appliedCanonical.add(migration.version);
+    }
+  }
+
+  const pending = all.filter(
+    (migration) => !appliedCanonical.has(migration.version),
+  );
+  verifyRollbackSafety(pending);
+  console.log(
+    `Migration preflight passed. ${pending.length} pending migration(s) are ready to apply.`,
+  );
+}
+
 async function migrateUp(options: { dryRun?: boolean } = {}): Promise<void> {
+  await migratePreflight();
   await ensureMigrationsTable();
 
   const all = discoverMigrations();
@@ -321,18 +379,21 @@ const dryRun = process.argv.slice(3).includes("--dry-run");
 (async () => {
   try {
     switch (command) {
+      case "preflight":
+        await withMigrationLock(migratePreflight);
+        break;
       case "up":
-        await migrateUp({ dryRun });
+        await withMigrationLock(() => migrateUp({ dryRun }));
         break;
       case "down":
-        await migrateDown();
+        await withMigrationLock(migrateDown);
         break;
       case "status":
-        await migrateStatus();
+        await withMigrationLock(migrateStatus);
         break;
       default:
         console.error(
-          `Unknown command: ${command ?? "(none)"}.\nUsage: migrate <up|down|status>`,
+          `Unknown command: ${command ?? "(none)"}.\nUsage: migrate <preflight|up|down|status>`,
         );
         process.exit(1);
     }

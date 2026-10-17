@@ -10,6 +10,21 @@ const isDRMode = (): boolean => !!DR_DATABASE_URL;
 const productionSsl =
   process.env.NODE_ENV === "production" ? { rejectUnauthorized: true } : undefined;
 
+const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS);
+const configuredStatementTimeoutMs = Number(process.env.DB_STATEMENT_TIMEOUT_MS);
+const statementTimeoutMs =
+  Number.isSafeInteger(configuredStatementTimeoutMs) &&
+  configuredStatementTimeoutMs > 0
+    ? configuredStatementTimeoutMs
+    : Math.max(
+        1,
+        Math.floor(
+          (Number.isSafeInteger(requestTimeoutMs) && requestTimeoutMs > 0
+            ? requestTimeoutMs
+            : 30000) * 0.9,
+        ),
+      );
+
 // Configuration for slow query logging
 const SLOW_QUERY_THRESHOLD_MS = parseInt(
   process.env.SLOW_QUERY_THRESHOLD_MS || "1000",
@@ -144,6 +159,7 @@ export const pool = new Pool({
   max: 1000,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 500,
+  statement_timeout: statementTimeoutMs,
   ssl: productionSsl,
 });
 
@@ -253,6 +269,7 @@ const replicaPools: Pool[] = replicaUrls.map(
       max: 50,
       idleTimeoutMillis: 30000,
       connectionTimeoutMillis: 500,
+      statement_timeout: statementTimeoutMs,
       ssl: productionSsl,
     }),
 );
