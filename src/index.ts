@@ -612,6 +612,116 @@ if (process.env.SENTRY_DSN) {
 app.use(timeoutErrorHandler);
 app.use(errorHandler);
 
+export interface ShutdownDependencies {
+  server?: { close: (cb: (err?: any) => void) => void; closeAllConnections?: () => void } | null;
+  wsManager?: { close: () => Promise<void> } | null;
+  requestTracker?: { activeCount: number; waitForZero: (timeoutMs: number) => Promise<void> };
+  stopWorkers?: () => Promise<void>;
+  shutdownQueue?: () => Promise<void>;
+  stopHeartbeat?: () => void;
+  closeDbPool?: () => Promise<void>;
+  disconnectRedis?: () => Promise<void>;
+  graphqlCleanup?: { dispose: () => Promise<void> } | null;
+}
+
+export async function executeGracefulShutdown(
+  deps: ShutdownDependencies,
+  timeoutMs: number = SHUTDOWN_TIMEOUT_MS,
+  stepTimeoutMs: number = 5000
+): Promise<{ success: boolean; closedSteps: string[]; errors: Array<{ step: string; error: string }> }> {
+  const closedSteps: string[] = [];
+  const errors: Array<{ step: string; error: string }> = [];
+
+  const runBoundedStep = async (stepName: string, fn: () => Promise<void> | void): Promise<void> => {
+    let timer: NodeJS.Timeout | null = null;
+    try {
+      console.log(`[Shutdown] Starting: ${stepName}`);
+      await Promise.race([
+        Promise.resolve(fn()),
+        new Promise<void>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`Timeout after ${stepTimeoutMs}ms`)), stepTimeoutMs);
+        }),
+      ]);
+      closedSteps.push(stepName);
+      console.log(`[Shutdown] Completed: ${stepName}`);
+    } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      errors.push({ step: stepName, error: errMsg });
+      console.warn(`[Shutdown] Step '${stepName}' failed or timed out: ${errMsg}`);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  // Step 1: Stop HTTP server from accepting new requests
+  if (deps.server) {
+    await runBoundedStep("stop_http_listener", () => {
+      return new Promise<void>((resolve) => {
+        deps.server!.close((error) => {
+          if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
+            console.error("[Shutdown] HTTP listener close error:", error);
+          }
+          resolve();
+        });
+      });
+    });
+  }
+
+  // Step 2: Drain in-flight active HTTP requests
+  if (deps.requestTracker) {
+    await runBoundedStep("drain_active_requests", async () => {
+      const active = deps.requestTracker!.activeCount;
+      if (active > 0) {
+        console.log(`[Shutdown] Waiting for ${active} active request(s) to finish (timeout ${timeoutMs}ms)`);
+      }
+      await deps.requestTracker!.waitForZero(timeoutMs);
+      if (deps.requestTracker!.activeCount > 0) {
+        console.warn(`[Shutdown] Timed out waiting for active requests. Remaining: ${deps.requestTracker!.activeCount}`);
+        deps.server?.closeAllConnections?.();
+      }
+    });
+  }
+
+  // Step 3: Stop background workers
+  if (deps.stopWorkers) {
+    await runBoundedStep("stop_background_workers", deps.stopWorkers);
+  }
+
+  // Step 4: Drain and stop background queue resources
+  if (deps.shutdownQueue) {
+    await runBoundedStep("stop_queues", deps.shutdownQueue);
+  }
+
+  // Step 5: Stop heartbeat and monitoring services
+  if (deps.stopHeartbeat) {
+    await runBoundedStep("stop_heartbeat", deps.stopHeartbeat);
+  }
+
+  // Step 6: Close WebSocket and GraphQL connection managers
+  if (deps.wsManager) {
+    await runBoundedStep("close_websocket_manager", async () => {
+      await deps.wsManager!.close();
+    });
+  }
+  if (deps.graphqlCleanup) {
+    await runBoundedStep("close_graphql_cleanup", async () => {
+      await deps.graphqlCleanup!.dispose();
+    });
+  }
+
+  // Step 7: Close Redis client connections
+  if (deps.disconnectRedis) {
+    await runBoundedStep("disconnect_redis", deps.disconnectRedis);
+  }
+
+  // Step 8: Close PostgreSQL connection pool
+  if (deps.closeDbPool) {
+    await runBoundedStep("close_db_pool", deps.closeDbPool);
+  }
+
+  return { success: errors.length === 0, closedSteps, errors };
+}
+
 async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
   if (shutdownInProgress) {
     console.log(`[Shutdown] ${signal} received; shutdown already in progress`);
@@ -623,79 +733,47 @@ async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
   console.log(`[Shutdown] Received ${signal}. Starting graceful shutdown...`);
 
   try {
-    if (server) {
-      console.log(
-        "[Shutdown] Stopping HTTP server from accepting new requests",
-      );
-      // Initiate listener closure before cleaning up dependencies so no new
-      // work can enter while the existing requests drain.
-      server.close((error) => {
-        if (
-          error &&
-          (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING"
-        ) {
-          console.error("[Shutdown] HTTP listener close failed", error);
-          return;
-        }
-        console.log("[Shutdown] HTTP listener closed");
-      });
-    }
+    const { stopNotificationWorker } = await import("./workers/notificationWorker.js").catch(() => ({
+      stopNotificationWorker: async () => {},
+    }));
+    const { shutdownQueue } = await import("./queue/index.js").catch(() => ({
+      shutdownQueue: async () => {},
+    }));
 
-    if (wsManager) {
-      console.log("[Shutdown] Closing WebSocket connections");
-      await wsManager.close();
-      wsManager = null;
-      console.log("[Shutdown] WebSocket connections closed");
-    }
+    const result = await executeGracefulShutdown(
+      {
+        server,
+        wsManager,
+        requestTracker,
+        stopWorkers: async () => {
+          await stopNotificationWorker();
+        },
+        shutdownQueue,
+        stopHeartbeat: () => {
+          stopHeartbeatService();
+        },
+        closeDbPool: async () => {
+          await pool.end();
+        },
+        disconnectRedis: async () => {
+          await disconnectRedis();
+        },
+        graphqlCleanup: graphqlServerCleanup,
+      },
+      SHUTDOWN_TIMEOUT_MS,
+      5000
+    );
 
-    const pendingAtStart = requestTracker.activeCount;
-    if (pendingAtStart > 0) {
-      console.log(
-        `[Shutdown] Waiting for ${pendingAtStart} active request(s) to finish (timeout ${SHUTDOWN_TIMEOUT_MS}ms)`,
-      );
-    }
+    wsManager = null;
+    graphqlServerCleanup = null;
 
-    await requestTracker.waitForZero(SHUTDOWN_TIMEOUT_MS);
-
-    if (requestTracker.activeCount > 0) {
-      console.warn(
-        `[Shutdown] Timed out waiting for active requests. Remaining: ${requestTracker.activeCount}`,
-      );
-      server?.closeAllConnections?.();
+    if (result.success) {
+      console.log("[Shutdown] Graceful shutdown completed cleanly");
+      process.exit(0);
     } else {
-      console.log("[Shutdown] All active requests finished");
+      console.warn(`[Shutdown] Graceful shutdown finished with ${result.errors.length} warning(s)`);
+      process.exit(0);
     }
-
-    console.log("[Shutdown] Draining queue resources");
-    const { shutdownQueue } = await import("./queue/index.js");
-    await shutdownQueue();
-    console.log("[Shutdown] Queue resources closed");
-
-    console.log("[Shutdown] Stopping heartbeat service");
-    stopHeartbeatService();
-    console.log("[Shutdown] Heartbeat service stopped");
-
-    console.log("[Shutdown] Closing PostgreSQL pool");
-    await pool.end();
-    console.log("[Shutdown] PostgreSQL pool closed");
-
-    console.log("[Shutdown] Closing Redis client");
-    await disconnectRedis();
-    console.log("[Shutdown] Redis client closed");
-
-    console.log("[Shutdown] Closing WebSocket servers");
-    if (wsManager) {
-      await wsManager.close();
-      wsManager = null;
-    }
-    if (graphqlServerCleanup) {
-      await graphqlServerCleanup.dispose();
-      graphqlServerCleanup = null;
-    }
-    console.log("[Shutdown] WebSocket servers closed");
-
-    console.log("[Shutdown] Graceful shutdown complete");
-    process.exit(0);
   } catch (error) {
     console.error("[Shutdown] Shutdown sequence failed", error);
     process.exit(1);
