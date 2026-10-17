@@ -4,6 +4,7 @@ import { encrypt, decrypt, hashSearchValue } from "../utils/encryption";
 import { WebSocketManager } from "../websocket";
 import { getRedisPubSub } from "../graphql/redisPubSub";
 import { CachedTransactionInvalidation } from "../services/cachedTransactionService";
+import { transactionStatusWorkflowService } from "../services/transactionStatusWorkflowService";
 import {
   SubscriptionChannels,
   transactionChannel,
@@ -446,7 +447,10 @@ export class TransactionModel {
     return mapTransactionRow(res.rows[0]);
   }
 
-  async updateStatus(id: string, status: TransactionStatus, userId?: string) {
+  async updateStatus(id: string, status: TransactionStatus, userId?: string, currentStatus?: TransactionStatus) {
+    if (currentStatus) {
+      transactionStatusWorkflowService.validateBaseTransition(id, currentStatus, status);
+    }
     let q = `UPDATE transactions SET status=$1, updated_at=NOW() WHERE id=$2`;
     const params: any[] = [status, id];
 

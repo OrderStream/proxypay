@@ -16,8 +16,8 @@ export type DetailedStatus =
   | "FLAGGED_FOR_REVIEW";
 
 export interface StatusHistoryEntry {
-  fromStatus?: DetailedStatus;
-  toStatus: DetailedStatus;
+  fromStatus?: DetailedStatus | TransactionStatus;
+  toStatus: DetailedStatus | TransactionStatus;
   reason?: string;
   explanation: string;
   updatedBy: string;
@@ -40,6 +40,35 @@ export class TransactionStatusWorkflowService {
     FLAGGED_FOR_REVIEW: ["INITIATED", "FUNDS_RESERVED", "FAILED"],
   };
 
+  private static readonly VALID_BASE_TRANSITIONS: Record<TransactionStatus, TransactionStatus[]> = {
+    [TransactionStatus.Pending]: [
+      TransactionStatus.Completed,
+      TransactionStatus.Failed,
+      TransactionStatus.Cancelled,
+      TransactionStatus.Review,
+    ],
+    [TransactionStatus.Review]: [
+      TransactionStatus.Pending,
+      TransactionStatus.Completed,
+      TransactionStatus.Failed,
+      TransactionStatus.Cancelled,
+    ],
+    [TransactionStatus.Completed]: [
+      TransactionStatus.Dispute,
+      TransactionStatus.Reversed,
+      TransactionStatus.ClawedBack,
+    ],
+    [TransactionStatus.Dispute]: [
+      TransactionStatus.Completed,
+      TransactionStatus.Reversed,
+      TransactionStatus.Failed,
+    ],
+    [TransactionStatus.Failed]: [],
+    [TransactionStatus.Cancelled]: [],
+    [TransactionStatus.Reversed]: [],
+    [TransactionStatus.ClawedBack]: [],
+  };
+
   private static readonly EXPLANATIONS: Record<DetailedStatus, string> = {
     INITIATED: "Transaction initiated by user or merchant.",
     KYC_VERIFYING: "Identity verification is actively being verified.",
@@ -58,11 +87,39 @@ export class TransactionStatusWorkflowService {
   private histories: Map<string, StatusHistoryEntry[]> = new Map();
 
   /**
-   * Validate if a transition between two statuses is allowed.
+   * Validate if a transition between two detailed statuses is allowed.
    */
   public isValidTransition(current: DetailedStatus, next: DetailedStatus): boolean {
     const allowed = TransactionStatusWorkflowService.VALID_TRANSITIONS[current] || [];
     return allowed.includes(next);
+  }
+
+  /**
+   * Validate if a transition between two base TransactionStatuses is allowed.
+   * Prevents scattered updates across handlers, workers, callbacks, and reconciliation from bypassing allowed transitions.
+   */
+  public isValidBaseTransition(current: TransactionStatus, next: TransactionStatus): boolean {
+    if (current === next) return true;
+    const allowed = TransactionStatusWorkflowService.VALID_BASE_TRANSITIONS[current] || [];
+    return allowed.includes(next);
+  }
+
+  /**
+   * Enforce allowed base status transitions, throwing an error if invalid.
+   */
+  public validateBaseTransition(txId: string, current: TransactionStatus, next: TransactionStatus): void {
+    if (!this.isValidBaseTransition(current, next)) {
+      const msg = `Invalid transaction status transition from ${current} to ${next} for transaction ${txId}`;
+      logger.error(`[StatusWorkflow] ${msg}`);
+      throw new Error(msg);
+    }
+  }
+
+  /**
+   * Get allowed next base statuses for a given status.
+   */
+  public getAllowedBaseTransitions(status: TransactionStatus): TransactionStatus[] {
+    return [...(TransactionStatusWorkflowService.VALID_BASE_TRANSITIONS[status] || [])];
   }
 
   /**
