@@ -8,6 +8,7 @@
     "prepare": "husky",
     "audit:high": "npm audit --audit-level=high",
     "snyk:test:high": "snyk test --severity-threshold=high",
+    "inventory:dependencies": "tsx src/scripts/generate-dependency-inventory.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "dev": "tsx watch src/index.ts",
