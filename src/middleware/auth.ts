@@ -7,6 +7,7 @@ import { getAdminSep10Service } from "../stellar/adminSep10";
 import { evaluateGeoLoginAccess } from "../auth/geo";
 import { queryRead } from "../config/database";
 import { ScopeGroup } from "../auth/apikeys";
+import { checkAccountStatus } from "./checkAccountStatus";
 
 type RequestUser = {
   id: string;
@@ -174,6 +175,7 @@ export const requireAuth = async (
  * JWT Authentication middleware that verifies JWT tokens
  * and attaches user information to the request object
  * Includes IP geofencing validation for operational regions
+ * and account status enforcement
  */
 export async function authenticateToken(
   req: Request,
@@ -211,7 +213,9 @@ export async function authenticateToken(
     }
 
     req.jwtUser = decoded;
-    next();
+    
+    // Check account status (frozen/suspended) before allowing request
+    await checkAccountStatus(req, res, next);
   } catch (error) {
     if (error instanceof Error) {
       if (error.message === "Token has expired") {
