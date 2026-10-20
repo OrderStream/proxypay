@@ -726,4 +726,128 @@ router.get(
   },
 );
 
+/**
+ * GET /api/fees/sep6/breakdown
+ * Get SEP-6 fee breakdown and analytics (admin only).
+ * Query params: from, to, assetCode, limit, offset
+ * 
+ * Returns aggregated fee revenue by asset code, transaction type, and time period.
+ */
+router.get(
+  "/sep6/breakdown",
+  authenticateToken,
+  requirePermission("admin:system"),
+  logFeeAction("GET_SEP6_FEE_BREAKDOWN"),
+  async (req: Request, res: Response) => {
+    try {
+      const { from, to, assetCode, limit = "50", offset = "0" } = req.query as Record<string, string | undefined>;
+
+      const fromDate = from ? new Date(from) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // default: last 30 days
+      const toDate = to ? new Date(to) : new Date();
+      const pageLimit = Math.min(parseInt(limit || "50", 10), 1000);
+      const pageOffset = parseInt(offset || "0", 10);
+
+      // Query fee audit records for SEP-6
+      const { records, total } = await feeAuditService.getAuditRecords({
+        provider: "sep6",
+        from: fromDate,
+        to: toDate,
+        limit: pageLimit,
+        offset: pageOffset,
+      });
+
+      // Aggregate fees by asset code and transaction type
+      const breakdown: Record<string, any> = {
+        totalRecords: total,
+        dateRange: { from: fromDate.toISOString(), to: toDate.toISOString() },
+        summary: {
+          totalFeeRevenue: 0,
+          totalTransactionVolume: 0,
+          averageFeePercentage: 0,
+          averageFlatFee: 0,
+          totalTransactions: records.length,
+        },
+        byAsset: {} as Record<string, any>,
+        byType: {} as Record<string, any>,
+        records: records.slice(0, 10), // Include first 10 detailed records
+      };
+
+      for (const record of records) {
+        breakdown.summary.totalFeeRevenue += record.calculatedFee;
+        breakdown.summary.totalTransactionVolume += record.inputAmount;
+
+        // Extract asset code from strategyId (format: sep6_XLM)
+        const [, asset] = record.strategyId.split("_");
+        if (asset) {
+          if (!breakdown.byAsset[asset]) {
+            breakdown.byAsset[asset] = {
+              asset,
+              feeRevenue: 0,
+              transactionVolume: 0,
+              count: 0,
+              avgFeePercentage: 0,
+            };
+          }
+          breakdown.byAsset[asset].feeRevenue += record.calculatedFee;
+          breakdown.byAsset[asset].transactionVolume += record.inputAmount;
+          breakdown.byAsset[asset].count += 1;
+          if (record.feePercentage) {
+            breakdown.byAsset[asset].avgFeePercentage = record.feePercentage;
+          }
+        }
+
+        // Extract transaction type from strategyName (format: "SEP-6 XLM Deposit" or "... Withdrawal")
+        const txType = record.strategyName.includes("Withdrawal") ? "withdrawal" : "deposit";
+        if (!breakdown.byType[txType]) {
+          breakdown.byType[txType] = {
+            type: txType,
+            feeRevenue: 0,
+            transactionVolume: 0,
+            count: 0,
+          };
+        }
+        breakdown.byType[txType].feeRevenue += record.calculatedFee;
+        breakdown.byType[txType].transactionVolume += record.inputAmount;
+        breakdown.byType[txType].count += 1;
+      }
+
+      // Calculate averages
+      if (records.length > 0) {
+        breakdown.summary.averageFeePercentage =
+          records.reduce((sum, r) => sum + (r.feePercentage || 0), 0) / records.length;
+        breakdown.summary.averageFlatFee =
+          records.reduce((sum, r) => sum + (r.flatAmount || 0), 0) / records.length;
+      }
+
+      // Apply asset filter if provided
+      if (assetCode) {
+        breakdown.records = breakdown.records.filter((r: any) =>
+          r.strategyId.includes(`_${assetCode}`)
+        );
+        breakdown.byAsset = assetCode in breakdown.byAsset ? { [assetCode]: breakdown.byAsset[assetCode] } : {};
+      }
+
+      res.json({
+        success: true,
+        data: breakdown,
+        pagination: {
+          total,
+          limit: pageLimit,
+          offset: pageOffset,
+        },
+      });
+    } catch (error: any) {
+      console.error("SEP-6 fee breakdown fetch error:", error);
+      throw createError(
+        ERROR_CODES.INTERNAL_ERROR,
+        "Failed to fetch SEP-6 fee breakdown",
+        {
+          success: false,
+          error: "Failed to fetch SEP-6 fee breakdown",
+        },
+      );
+    }
+  },
+);
+
 export default router;

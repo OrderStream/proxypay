@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import { StrKey } from "stellar-sdk";
 import { Pool } from "pg";
 import { Sep12Service, Sep12CustomerStatus } from "./sep12";
+import { feeAuditService } from "../services/feeAuditService";
 import logger from "../utils/logger";
 
 const getSep6FallbackConfig = () => ({
@@ -63,9 +64,9 @@ export const createSep6Router = (db: Pool): Router => {
     memoryTransactions.set(record.id, record);
     try {
       await db.query(
-        `INSERT INTO transactions (id, reference_number, type, amount, status, user_id, metadata, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
-         ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()`,
+        `INSERT INTO transactions (id, reference_number, type, amount, status, user_id, metadata, fee_amount, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+         ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, fee_amount = EXCLUDED.fee_amount, updated_at = NOW()`,
         [
           record.id,
           record.memo || record.id.substring(0, 16),
@@ -74,6 +75,7 @@ export const createSep6Router = (db: Pool): Router => {
           record.status,
           record.account || "system",
           JSON.stringify(record),
+          record.total_fee || 0,
         ]
       );
     } catch (e: any) {
@@ -139,6 +141,7 @@ export const createSep6Router = (db: Pool): Router => {
   /**
    * GET /deposit
    * Returns instructions for depositing fiat and tracks the transaction.
+   * Now tracks fees in transactions table and fee_audit_log.
    */
   sep6Router.get("/deposit", async (req: Request, res: Response) => {
     try {
@@ -167,7 +170,20 @@ export const createSep6Router = (db: Pool): Router => {
       }
 
       const transactionId = uuidv4();
-      const fee_fixed = 0.5;
+      const config = await getAssetConfig();
+      const assetConfig = config.assets[asset_code as string];
+      
+      if (!assetConfig) {
+        return res.status(400).json({ error: `unsupported asset: ${asset_code}` });
+      }
+
+      const transactionAmount = parseFloat(amount as string) || 0;
+      
+      // Calculate fees
+      const feeFixed = assetConfig.fee_fixed || 0;
+      const feePercent = assetConfig.fee_percent || 0;
+      const percentageFee = (transactionAmount * feePercent) / 100;
+      const totalFee = parseFloat((feeFixed + percentageFee).toFixed(7));
 
       const record = {
         id: transactionId,
@@ -175,18 +191,47 @@ export const createSep6Router = (db: Pool): Router => {
         status: "pending_user_transfer_start",
         account,
         asset_code,
-        amount: amount || "0",
-        fee_fixed,
+        amount: transactionAmount,
+        fee_fixed: feeFixed,
+        fee_percent: feePercent,
+        total_fee: totalFee,
         email_address,
         created_at: new Date().toISOString(),
       };
 
       await persistTransaction(record);
 
+      // Log fee to audit log
+      try {
+        await feeAuditService.logFeeCalculation({
+          transactionId,
+          provider: "sep6",
+          inputAmount: transactionAmount,
+          calculatedFee: totalFee,
+          totalAmount: transactionAmount + totalFee,
+          strategyId: `sep6_${asset_code}`,
+          strategyName: `SEP-6 ${asset_code} Deposit`,
+          strategyType: "mixed",
+          strategyScope: "sep6",
+          feePercentage: feePercent,
+          flatAmount: feeFixed,
+          feeMinimum: assetConfig.min_amount,
+          feeMaximum: assetConfig.max_amount,
+          timeOverrideActive: false,
+          rawFee: totalFee,
+          clampedFee: totalFee,
+        });
+      } catch (auditErr) {
+        logger.warn({ error: auditErr }, "[SEP-6 Deposit] Failed to log fee audit");
+        // Non-fatal — continue processing
+      }
+
       res.json({
         how: "Please wire funds to Bank XYZ, Account 123456789, Routing 987654321. Include the transaction ID in the memo.",
         id: transactionId,
-        fee_fixed,
+        fee_fixed: feeFixed,
+        fee_percent: feePercent,
+        total_fee: totalFee,
         extra_info: {
           message: "Transfers typically take 1-2 business days.",
         },
@@ -200,6 +245,7 @@ export const createSep6Router = (db: Pool): Router => {
   /**
    * GET /withdraw
    * Returns the anchor's Stellar account where the user should send the asset.
+   * Now tracks fees in transactions table and fee_audit_log.
    */
   sep6Router.get("/withdraw", async (req: Request, res: Response) => {
     try {
@@ -234,6 +280,19 @@ export const createSep6Router = (db: Pool): Router => {
 
       const transactionId = uuidv4();
       const memo = transactionId.replace(/-/g, "").substring(0, 32);
+      
+      const assetConfig = config.assets[asset_code as string];
+      if (!assetConfig) {
+        return res.status(400).json({ error: `unsupported asset: ${asset_code}` });
+      }
+
+      const transactionAmount = parseFloat(amount as string) || 0;
+      
+      // Calculate fees
+      const feeFixed = assetConfig.fee_fixed || 0;
+      const feePercent = assetConfig.fee_percent || 0;
+      const percentageFee = (transactionAmount * feePercent) / 100;
+      const totalFee = parseFloat((feeFixed + percentageFee).toFixed(7));
 
       const record = {
         id: transactionId,
@@ -243,19 +302,49 @@ export const createSep6Router = (db: Pool): Router => {
         dest_extra,
         asset_code,
         account,
-        amount: amount || "0",
+        amount: transactionAmount,
+        fee_fixed: feeFixed,
+        fee_percent: feePercent,
+        total_fee: totalFee,
         memo,
         created_at: new Date().toISOString(),
       };
 
       await persistTransaction(record);
 
+      // Log fee to audit log
+      try {
+        await feeAuditService.logFeeCalculation({
+          transactionId,
+          provider: "sep6",
+          inputAmount: transactionAmount,
+          calculatedFee: totalFee,
+          totalAmount: transactionAmount + totalFee,
+          strategyId: `sep6_${asset_code}`,
+          strategyName: `SEP-6 ${asset_code} Withdrawal`,
+          strategyType: "mixed",
+          strategyScope: "sep6",
+          feePercentage: feePercent,
+          flatAmount: feeFixed,
+          feeMinimum: assetConfig.min_amount,
+          feeMaximum: assetConfig.max_amount,
+          timeOverrideActive: false,
+          rawFee: totalFee,
+          clampedFee: totalFee,
+        });
+      } catch (auditErr) {
+        logger.warn({ error: auditErr }, "[SEP-6 Withdraw] Failed to log fee audit");
+        // Non-fatal — continue processing
+      }
+
       res.json({
         account: config.anchorStellarAccount,
         memo,
         memo_type: "text",
         id: transactionId,
-        fee_fixed: 0.5,
+        fee_fixed: feeFixed,
+        fee_percent: feePercent,
+        total_fee: totalFee,
       });
     } catch (error: any) {
       logger.error({ error: error.message }, "[SEP-6 Withdraw Error]");
