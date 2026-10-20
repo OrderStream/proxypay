@@ -416,13 +416,6 @@ export const WebhookCircuitBreakerTransitionTotal = new Counter({
   registers: [register],
 });
 
-export const WebhookCircuitBreakerState = new Gauge({
-  name: "webhook_circuit_breaker_state",
-  help: "Current webhook circuit breaker state (0=open, 0.5=half_open, 1=closed)",
-  labelNames: ["state"],
-  registers: [register],
-});
-
 // Webhook Retry Metrics
 export const webhookRetryAttemptsTotal = new Counter({
   name: "webhook_retry_attempts_total",

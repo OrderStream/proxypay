@@ -214,35 +214,92 @@ export async function updateUserRole(
   return user;
 }
 
+export interface UpdateUserByIdInput {
+  email?: string;
+  phone_number?: string;
+  display_name?: string | null;
+  mcc?: string | null;
+  first_name?: string;
+  last_name?: string;
+  address?: string;
+  date_of_birth?: string;
+  id_number?: string;
+  kyc_level?: string;
+  status?: string;
+}
+
+export const ALLOWED_USER_UPDATE_FIELDS: (keyof UpdateUserByIdInput)[] = [
+  "email",
+  "phone_number",
+  "display_name",
+  "mcc",
+  "first_name",
+  "last_name",
+  "address",
+  "date_of_birth",
+  "id_number",
+  "kyc_level",
+  "status",
+];
+
 /**
  * Update user by id
  */
 export async function updateUserById(
   userId: string,
-  userUpdate: Partial<User>,
+  userUpdate: Partial<UpdateUserByIdInput>,
 ): Promise<User> {
-  const allowedKeys = ["name", "email", "phone_number", "mcc", "display_name"] as const;
+  const allowedKeys = ALLOWED_USER_UPDATE_FIELDS as const;
   const keys = Object.keys(userUpdate).filter((k) =>
     allowedKeys.includes(k as any),
-  ) as (keyof typeof userUpdate)[];
+  ) as (keyof UpdateUserByIdInput)[];
 
   if (keys.length === 0) {
     throw new Error("No valid fields to update");
   }
 
-  const setClause = keys.map((k, i) => `${k} = ($${i + 1})`).join(", ");
-  const values = keys.map((k) => userUpdate[k]);
+  const setClauses: string[] = [];
+  const values: any[] = [];
+  let idx = 1;
 
-  if (userUpdate.mcc !== undefined && userUpdate.mcc !== null) {
-    if (!isValidMerchantMCC(userUpdate.mcc)) {
-      throw new Error(`Invalid Merchant MCC code '${userUpdate.mcc}'.`);
+  for (const k of keys) {
+    let value = userUpdate[k];
+
+    if (k === "mcc") {
+      if (value !== undefined && value !== null) {
+        if (typeof value !== "string" || !isValidMerchantMCC(value)) {
+          throw new Error(`Invalid Merchant MCC code '${value}'.`);
+        }
+        value = value.trim();
+      }
     }
-    userUpdate.mcc = userUpdate.mcc.trim();
+
+    if (k === "phone_number") {
+      if (value !== undefined && value !== null) {
+        value = encrypt(String(value), true);
+      }
+    }
+
+    if (k === "email") {
+      if (value !== undefined && value !== null) {
+        value = encrypt(String(value));
+      }
+    }
+
+    if (k === "first_name" || k === "last_name" || k === "address" || k === "date_of_birth" || k === "id_number") {
+      if (value !== undefined && value !== null) {
+        value = encrypt(String(value));
+      }
+    }
+
+    setClauses.push(`${k} = ($${idx})`);
+    values.push(value);
+    idx++;
   }
 
   const query = `UPDATE users
-                SET ${setClause}, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ($${keys.length + 1})
+                SET ${setClauses.join(", ")}, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ($${idx})
                 RETURNING *`;
 
   try {
@@ -252,7 +309,15 @@ export async function updateUserById(
       throw new Error(`User '${userId}' not found`);
     }
 
-    return result.rows[0];
+    const row = result.rows[0];
+    return {
+      ...row,
+      phone_number: decrypt(row.phone_number) as string,
+      two_factor_secret: decrypt(row.two_factor_secret),
+      display_name: row.display_name ?? null,
+      mcc: row.mcc ?? null,
+      email: decrypt(row.email),
+    };
   } catch (err) {
     console.error("updateUser", err);
     throw err;
