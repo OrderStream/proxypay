@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
- * Migration Runner (Issue #45)
+ * Migration CLI (Issue #45 — hardened with validation, dry-run, and impact
+ * analysis).
  *
- * Provides a lightweight, dependency-free migration system using raw SQL files
- * stored in the `migrations/` directory. It tracks applied migrations in a
+ * A lightweight, dependency-free migration system using raw SQL files stored
+ * in the `migrations/` directory. It tracks applied migrations in a
  * `schema_migrations` table in PostgreSQL.
  *
  * Usage (via npm scripts defined in package.json):
@@ -23,6 +24,9 @@ import fs from "fs";
 import path from "path";
 import { Pool } from "pg";
 import dotenv from "dotenv";
+import { MigrationRunner } from "../migrations/runner";
+import { analyzeMigrationsDir, formatImpactReport } from "../migrations/impact";
+import { formatValidationResult } from "../migrations/validation";
 
 dotenv.config();
 
@@ -31,7 +35,9 @@ dotenv.config();
 // ---------------------------------------------------------------------------
 
 const isSandbox = process.env.IS_SANDBOX === "true";
-const dbUrl = isSandbox ? (process.env.SANDBOX_DATABASE_URL || process.env.DATABASE_URL) : process.env.DATABASE_URL;
+const dbUrl = isSandbox
+  ? process.env.SANDBOX_DATABASE_URL || process.env.DATABASE_URL
+  : process.env.DATABASE_URL;
 
 const pool = new Pool({
   connectionString: dbUrl,
@@ -82,116 +88,39 @@ async function ensureMigrationsTable(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// File discovery
+// Commands
 // ---------------------------------------------------------------------------
 
-const MIGRATIONS_DIR = path.resolve(__dirname, "..", "..", "migrations");
+async function printStatus(): Promise<void> {
+  const rows = await runner.status();
+  const appliedCount = rows.filter((r) => r.status === "applied").length;
+  const pendingCount = rows.length - appliedCount;
 
-interface MigrationFile {
-  version: string;
-  legacyVersion: string;
-  name: string;
-  upPath: string;
-  downPath: string | null;
+  console.log("\nMigration Status:");
+  console.log("=================");
+  for (const row of rows) {
+    console.log(`  [${row.status}] ${row.name}`);
+  }
+  console.log(
+    `\nTotal: ${rows.length} migration(s), ${appliedCount} applied, ${pendingCount} pending.\n`,
+  );
 }
 
-function discoverMigrations(): MigrationFile[] {
-  const files = fs
-    .readdirSync(MIGRATIONS_DIR)
-    .filter((f) => /^\d+_.+\.sql$/.test(f) && !f.endsWith(".down.sql"))
-    .sort();
-
-  const migrations = files.map((filename) => {
-    const match = filename.match(/^(\d+)_(.+)\.sql$/);
-    if (!match) throw new Error(`Unexpected migration filename: ${filename}`);
-
-    const [, legacyVersion, label] = match;
-    const downFilename = `${legacyVersion}_${label}.down.sql`;
-    const downPath = path.join(MIGRATIONS_DIR, downFilename);
-
-    return {
-      version: filename.replace(/\.sql$/, ""),
-      legacyVersion,
-      name: filename,
-      upPath: path.join(MIGRATIONS_DIR, filename),
-      downPath: fs.existsSync(downPath) ? downPath : null,
-    };
-  });
-
-  const versions = new Map<string, string[]>();
-  for (const migration of migrations) {
-    const existing = versions.get(migration.version) ?? [];
-    existing.push(migration.name);
-    versions.set(migration.version, existing);
-  }
-
-  const duplicates = [...versions.entries()].filter(
-    ([, names]) => names.length > 1,
-  );
-
-  if (duplicates.length > 0) {
-    const lines = duplicates
-      .map(([version, names]) => `version ${version}: ${names.join(", ")}`)
-      .join("; ");
-    throw new Error(
-      `Duplicate migration version prefix detected. Each migration number must be unique. Conflicts: ${lines}`,
-    );
-  }
-
-  return migrations;
-}
-
-async function normalizeLegacyAppliedVersions(
-  migrations: MigrationFile[],
-): Promise<void> {
-  const result = await pool.query<{ version: string }>(
-    "SELECT version FROM schema_migrations WHERE version ~ '^[0-9]+$' ORDER BY version",
-  );
-
-  if (result.rows.length === 0) return;
-
-  const migrationByLegacyVersion = new Map<string, MigrationFile[]>();
-  for (const migration of migrations) {
-    const group = migrationByLegacyVersion.get(migration.legacyVersion) ?? [];
-    group.push(migration);
-    migrationByLegacyVersion.set(migration.legacyVersion, group);
-  }
-
-  const currentlyApplied = await getAppliedVersions();
-
-  for (const row of result.rows) {
-    const candidates = migrationByLegacyVersion.get(row.version);
-    if (!candidates || candidates.length === 0) {
-      console.warn(
-        `No migration file found for legacy applied version ${row.version}; leaving as-is.`,
-      );
-      continue;
-    }
-
-    const targetVersion = candidates[0].version;
-    if (currentlyApplied.has(targetVersion)) {
-      await pool.query("DELETE FROM schema_migrations WHERE version = $1", [
-        row.version,
-      ]);
-      continue;
-    }
-
-    await pool.query(
-      "UPDATE schema_migrations SET version = $1 WHERE version = $2",
-      [targetVersion, row.version],
-    );
+async function printValidate(): Promise<void> {
+  const result = runner.validate();
+  console.log(formatValidationResult(result));
+  if (!result.valid) {
+    process.exitCode = 1;
   }
 }
 
-// ---------------------------------------------------------------------------
-// Core operations
-// ---------------------------------------------------------------------------
-
-async function getAppliedVersions(): Promise<Set<string>> {
-  const result = await pool.query<{ version: string }>(
-    "SELECT version FROM schema_migrations ORDER BY version",
-  );
-  return new Set(result.rows.map((r) => r.version));
+async function printAnalyze(jsonOutput: boolean): Promise<void> {
+  const report = analyzeMigrationsDir(migrationsDir);
+  if (jsonOutput) {
+    console.log(JSON.stringify(report, null, 2));
+  } else {
+    console.log(formatImpactReport(report));
+  }
 }
 
 async function getAppliedVersionsForPreflight(): Promise<Set<string>> {
@@ -216,8 +145,7 @@ function verifyRollbackSafety(pending: MigrationFile[]): void {
   if (missingRollback.length > 0) {
     const names = missingRollback.map((m) => m.name).join(", ");
     throw new Error(
-      `Pre-flight check failed: missing rollback file (.down.sql) for: ${names}. ` +
-        `Add a rollback file for each migration before applying.`,
+      `Invalid migration name: "${name ?? ""}". Use lowercase letters, digits and underscores, e.g. "add_user_avatar".`,
     );
   }
 }
@@ -269,103 +197,27 @@ async function migrateUp(options: { dryRun?: boolean } = {}): Promise<void> {
       await client.query("BEGIN");
       await client.query(sql);
 
-      if (options.dryRun) {
-        // Verify the migration applies cleanly against the real schema, then
-        // discard the change — nothing is persisted in dry-run mode.
-        await client.query("ROLLBACK");
-        console.log(`  Dry-run OK (rolled back): ${migration.name}`);
-        continue;
-      }
+  const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const version = `${stamp}_${name}`;
+  const upPath = path.join(migrationsDir, `${version}.sql`);
+  const downPath = path.join(migrationsDir, `${version}.down.sql`);
 
-      await client.query(
-        "INSERT INTO schema_migrations (version) VALUES ($1)",
-        [migration.version],
-      );
-      await client.query("COMMIT");
-      console.log(`  Applied: ${migration.name}`);
-    } catch (err) {
-      await client.query("ROLLBACK");
-      console.error(`  Failed to apply ${migration.name}:`, err);
-      throw err;
-    } finally {
-      client.release();
-    }
+  if (fs.existsSync(upPath)) {
+    throw new Error(`Migration already exists: ${version}`);
   }
 
-  console.log(
-    options.dryRun
-      ? `Dry-run complete. ${pending.length} migration(s) verified without applying.`
-      : `Migration complete. Applied ${pending.length} migration(s).`,
+  fs.writeFileSync(
+    upPath,
+    `-- Migration: ${version}\n-- Description: <describe the change>\n\n`,
   );
-}
-
-async function migrateDown(): Promise<void> {
-  await ensureMigrationsTable();
-  const all = discoverMigrations();
-  await normalizeLegacyAppliedVersions(all);
-
-  const result = await pool.query<{ version: string }>(
-    "SELECT version FROM schema_migrations ORDER BY applied_at DESC LIMIT 1",
+  fs.writeFileSync(
+    downPath,
+    `-- Rollback: ${version}\n-- Description: <reverse the change>\n\n`,
   );
-  if (result.rows.length === 0) {
-    console.log("No migrations to roll back.");
-    return;
-  }
 
-  const lastVersion = result.rows[0].version;
-  const migration = all.find((m) => m.version === lastVersion);
-
-  if (!migration) {
-    console.error(`Could not find migration file for version: ${lastVersion}`);
-    process.exit(1);
-  }
-
-  if (!migration.downPath) {
-    console.error(
-      `No rollback file found for ${migration.name}. Expected: ${migration.version}_*.down.sql`,
-    );
-    process.exit(1);
-  }
-
-  const sql = fs.readFileSync(migration.downPath, "utf-8");
-  console.log(`Rolling back migration ${migration.version}: ${migration.name}`);
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    await client.query(sql);
-    await client.query("DELETE FROM schema_migrations WHERE version = $1", [
-      migration.version,
-    ]);
-    await client.query("COMMIT");
-    console.log(`  Rolled back: ${migration.name}`);
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error(`  Failed to roll back ${migration.name}:`, err);
-    throw err;
-  } finally {
-    client.release();
-  }
-}
-
-async function migrateStatus(): Promise<void> {
-  await ensureMigrationsTable();
-
-  const all = discoverMigrations();
-  await normalizeLegacyAppliedVersions(all);
-  const applied = await getAppliedVersions();
-
-  console.log("\nMigration Status:");
-  console.log("=================");
-
-  for (const migration of all) {
-    const status = applied.has(migration.version) ? "applied" : "pending";
-    console.log(`  [${status}] ${migration.name}`);
-  }
-
-  const pendingCount = all.filter((m) => !applied.has(m.version)).length;
+  console.log(`Created migration files:\n  ${upPath}\n  ${downPath}`);
   console.log(
-    `\nTotal: ${all.length} migration(s), ${applied.size} applied, ${pendingCount} pending.\n`,
+    "\nNote: the pre-flight rollback-safety check requires every new migration to ship with a .down.sql file — the template above is created for you.",
   );
 }
 
@@ -375,6 +227,8 @@ async function migrateStatus(): Promise<void> {
 
 const command = process.argv[2];
 const dryRun = process.argv.slice(3).includes("--dry-run");
+const jsonOutput = process.argv.slice(3).includes("--json");
+const createName = process.argv[3];
 
 (async () => {
   try {
@@ -395,11 +249,11 @@ const dryRun = process.argv.slice(3).includes("--dry-run");
         console.error(
           `Unknown command: ${command ?? "(none)"}.\nUsage: migrate <preflight|up|down|status>`,
         );
-        process.exit(1);
+        process.exitCode = 1;
     }
   } catch (err) {
     console.error("Migration runner error:", err);
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
     await pool.end();
   }

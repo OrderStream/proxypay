@@ -17,6 +17,9 @@ export interface User {
   two_factor_enabled?: boolean;
   two_factor_verified?: boolean;
   backup_codes?: string[] | null;
+  is_active: boolean;
+  deactivated_at?: Date | null;
+  status: 'active' | 'frozen' | 'suspended';
   created_at: Date;
   updated_at: Date;
 }
@@ -53,6 +56,8 @@ export async function getUserByPhoneNumber(
       u.two_factor_enabled,
       u.two_factor_verified,
       u.backup_codes,
+      u.is_active,
+      u.deactivated_at,
       u.created_at,
       u.updated_at,
       r.name as role_name
@@ -88,6 +93,8 @@ export async function getUserById(userId: string): Promise<User | null> {
       u.two_factor_enabled,
       u.two_factor_verified,
       u.backup_codes,
+      u.is_active,
+      u.deactivated_at,
       u.created_at,
       u.updated_at,
       r.name as role_name
@@ -141,7 +148,7 @@ export async function createUser(userData: CreateUserRequest): Promise<User> {
   const query = `
     INSERT INTO users (phone_number, kyc_level, role_id, mcc, display_name)
     VALUES ($1, $2, $3, $4, $5)
-    RETURNING id, phone_number, kyc_level, role_id, display_name, mcc, two_factor_secret, two_factor_enabled, two_factor_verified, backup_codes, created_at, updated_at
+    RETURNING id, phone_number, kyc_level, role_id, display_name, mcc, two_factor_secret, two_factor_enabled, two_factor_verified, backup_codes, is_active, deactivated_at, created_at, updated_at
   `;
 
   const encryptedPhone = encrypt(phone_number, true);
@@ -187,7 +194,7 @@ export async function updateUserRole(
     UPDATE users 
     SET role_id = $1, updated_at = CURRENT_TIMESTAMP
     WHERE id = $2
-    RETURNING id, phone_number, kyc_level, role_id, two_factor_secret, backup_codes, created_at, updated_at
+    RETURNING id, phone_number, kyc_level, role_id, two_factor_secret, backup_codes, is_active, deactivated_at, created_at, updated_at
   `;
 
   const result = await pool.query(query, [roleId, userId]);
@@ -207,35 +214,92 @@ export async function updateUserRole(
   return user;
 }
 
+export interface UpdateUserByIdInput {
+  email?: string;
+  phone_number?: string;
+  display_name?: string | null;
+  mcc?: string | null;
+  first_name?: string;
+  last_name?: string;
+  address?: string;
+  date_of_birth?: string;
+  id_number?: string;
+  kyc_level?: string;
+  status?: string;
+}
+
+export const ALLOWED_USER_UPDATE_FIELDS: (keyof UpdateUserByIdInput)[] = [
+  "email",
+  "phone_number",
+  "display_name",
+  "mcc",
+  "first_name",
+  "last_name",
+  "address",
+  "date_of_birth",
+  "id_number",
+  "kyc_level",
+  "status",
+];
+
 /**
  * Update user by id
  */
 export async function updateUserById(
   userId: string,
-  userUpdate: Partial<User>,
+  userUpdate: Partial<UpdateUserByIdInput>,
 ): Promise<User> {
-  const allowedKeys = ["name", "email", "phone_number", "mcc", "display_name"] as const;
+  const allowedKeys = ALLOWED_USER_UPDATE_FIELDS as const;
   const keys = Object.keys(userUpdate).filter((k) =>
     allowedKeys.includes(k as any),
-  ) as (keyof typeof userUpdate)[];
+  ) as (keyof UpdateUserByIdInput)[];
 
   if (keys.length === 0) {
     throw new Error("No valid fields to update");
   }
 
-  const setClause = keys.map((k, i) => `${k} = ($${i + 1})`).join(", ");
-  const values = keys.map((k) => userUpdate[k]);
+  const setClauses: string[] = [];
+  const values: any[] = [];
+  let idx = 1;
 
-  if (userUpdate.mcc !== undefined && userUpdate.mcc !== null) {
-    if (!isValidMerchantMCC(userUpdate.mcc)) {
-      throw new Error(`Invalid Merchant MCC code '${userUpdate.mcc}'.`);
+  for (const k of keys) {
+    let value = userUpdate[k];
+
+    if (k === "mcc") {
+      if (value !== undefined && value !== null) {
+        if (typeof value !== "string" || !isValidMerchantMCC(value)) {
+          throw new Error(`Invalid Merchant MCC code '${value}'.`);
+        }
+        value = value.trim();
+      }
     }
-    userUpdate.mcc = userUpdate.mcc.trim();
+
+    if (k === "phone_number") {
+      if (value !== undefined && value !== null) {
+        value = encrypt(String(value), true);
+      }
+    }
+
+    if (k === "email") {
+      if (value !== undefined && value !== null) {
+        value = encrypt(String(value));
+      }
+    }
+
+    if (k === "first_name" || k === "last_name" || k === "address" || k === "date_of_birth" || k === "id_number") {
+      if (value !== undefined && value !== null) {
+        value = encrypt(String(value));
+      }
+    }
+
+    setClauses.push(`${k} = ($${idx})`);
+    values.push(value);
+    idx++;
   }
 
   const query = `UPDATE users
-                SET ${setClause}, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ($${keys.length + 1})
+                SET ${setClauses.join(", ")}, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ($${idx})
                 RETURNING *`;
 
   try {
@@ -245,7 +309,15 @@ export async function updateUserById(
       throw new Error(`User '${userId}' not found`);
     }
 
-    return result.rows[0];
+    const row = result.rows[0];
+    return {
+      ...row,
+      phone_number: decrypt(row.phone_number) as string,
+      two_factor_secret: decrypt(row.two_factor_secret),
+      display_name: row.display_name ?? null,
+      mcc: row.mcc ?? null,
+      email: decrypt(row.email),
+    };
   } catch (err) {
     console.error("updateUser", err);
     throw err;
@@ -272,8 +344,8 @@ export async function deactivateUserAccount(userId: string, dbPool?: Pool) {
     }
 
     // 2. Scrub PII while preserving foreign keys
-    // TODO: The `User` type and database table needs to
-    // be update with these fields:  is_active: boolean,   deactivated_at:Date`
+    // The `is_active` and `deactivated_at` columns are declared in the
+    // users table schema (see migrations) and mirrored on the `User` type.
     await client.query(
       `UPDATE users
        SET 
@@ -302,100 +374,7 @@ export async function deactivateUserAccount(userId: string, dbPool?: Pool) {
 
     // await pool.query(`DELETE FROM user_api_keys WHERE user_id = $1`, [userId]);
 
-    // 5. Archive transaction history (optional: keep for compliance)
-    // await pool.query(
-    //   `UPDATE user_transactions
-    //    SET user_id = NULL, anonymized = true
-    //    WHERE user_id = $1`,
-    //   [userId],
-    // );
-
-    // 6. Log the deactivation
-    // await pool.query(
-    //   `INSERT INTO audit_log (action, user_id, timestamp)
-    //    VALUES ($1, $2, CURRENT_TIMESTAMP)`,
-    //   ["account_deactivated", userId],
-    // );
-
-    await client.query("COMMIT");
-  } catch (err) {
-    if (client) {
-      await client.query("ROLLBACK");
-    }
-    console.error("deactivateUserAccount error:", err);
-    throw err;
-  } finally {
-    if (client) client.release();
-  }
-}
-
-/**
- * Authenticate user (simplified for demo)
- * In a real app, you would verify phone number via OTP, password, etc.
- */
-export async function authenticateUser(
-  phoneNumber: string,
-): Promise<User | null> {
-  const user = await getUserByPhoneNumber(phoneNumber);
-
-  if (!user) {
-    // Auto-create user for demo (in production, require proper registration)
-    try {
-      return await createUser({ phone_number: phoneNumber });
-    } catch (error) {
-      console.error("Failed to create user:", error);
-      return null;
-    }
-  }
-
-  return user;
-}
-
-/**
- * Get all users with their roles (admin function)
- */
-export async function getAllUsers(): Promise<User[]> {
-  const query = `
-    SELECT 
-      u.id,
-      u.phone_number,
-      u.kyc_level,
-      u.role_id,
-      u.two_factor_secret,
-      u.two_factor_enabled,
-      u.two_factor_verified,
-      u.backup_codes,
-      u.created_at,
-      u.updated_at,
-      r.name as role_name
-    FROM users u
-    LEFT JOIN roles r ON u.role_id = r.id
-    ORDER BY u.created_at DESC
-  `;
-
-  const result = await pool.query(query);
-  return result.rows.map(row => ({
-    ...row,
-    phone_number: decrypt(row.phone_number) as string,
-    two_factor_secret: decrypt(row.two_factor_secret),
-  }));
-}
-
-/**
- * Get user permissions
- */
-export async function getUserPermissions(userId: string): Promise<string[]> {
-  const query = `
-    SELECT p.name as permission_name
-    FROM permissions p
-    JOIN role_permissions rp ON p.id = rp.permission_id
-    JOIN users u ON u.role_id = rp.role_id
-    WHERE u.id = $1
-  `;
-
-  const result = await pool.query(query, [userId]);
-  return result.rows.map((row) => row.permission_name);
-}
+    // 5. Archive transaction history (optional: 
 
 export async function invalidateUserOnPasswordChange(userId: string): Promise<void> {
   const userModel = new UserModel();
@@ -416,5 +395,19 @@ export async function invalidateUserOnPasswordChange(userId: string): Promise<vo
   }
 
   // 3. Flush Redis express-sessions and flag active stateless JWTs
+  await flushUserSessions(userId);
+}
+
+/**
+ * Revokes active sessions for a user after a non-active status change
+ * (freeze/suspend/deactivate) so open WebSockets and GraphQL subscriptions are
+ * terminated immediately (issue #814). `flushUserSessions` also publishes the
+ * cross-instance `ws.auth.revoked` event.
+ */
+export async function revokeUserSessionsOnStatusChange(
+  userId: string,
+  status: string,
+): Promise<void> {
+  if (status === "active") return;
   await flushUserSessions(userId);
 }

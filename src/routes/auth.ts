@@ -6,7 +6,10 @@ import {
   JWTPayload,
   generateRefreshToken,
   verifyRefreshToken,
+  createSessionBinding,
+  registerJwtSession,
 } from "../auth/jwt";
+import { v4 as uuidv4 } from "uuid";
 import { createSSORouter } from "../auth/sso";
 import { createOIDCRouter, initializeOIDCProviders } from "../auth/oidc";
 import { enforceSSOForEmployees } from "../middleware/ssoEnforcement";
@@ -22,6 +25,7 @@ import {
 import { getLockoutStatus, recordFailedAttempt } from "../auth/lockout";
 import { verifyTOTPToken, verifyBackupCode, is2FAEnabled } from "../auth/2fa";
 import { evaluateAdminLoginAnomaly } from "../services/loginAnomaly";
+import { activityTrackingService } from "../services/activityTrackingService";
 import { checkDeviceFingerprint } from "../middleware/fingerprint";
 import { validateRequest } from "../middleware/validation";
 import { hashPassword } from "../utils/password";
@@ -34,24 +38,15 @@ import {
 } from "../middleware/authRateLimit";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
+import { registerSchema } from "../validation/authSchemas";
 
 const emailService = new EmailService();
 
 export const authRoutes = Router();
 
-export const registerSchema = z.object({
-  phone_number: z.string().min(1, "phone_number is required"),
-  password: z
-    .string()
-    .min(12, "Password must be at least 12 characters")
-    .regex(/[A-Z]/, "Password must contain at least one uppercase letter")
-    .regex(/[a-z]/, "Password must contain at least one lowercase letter")
-    .regex(/[0-9]/, "Password must contain at least one number")
-    .regex(
-      /[^A-Za-z0-9]/,
-      "Password must contain at least one special character",
-    ),
-});
+// Shared with the OpenAPI generator (src/openapi/schemas/auth.ts) so the
+// documented constraints always match what this endpoint accepts.
+export { registerSchema };
 
 /**
  * POST /api/auth/register
@@ -232,9 +227,22 @@ authRoutes.post(
         role: user.role_name || "user",
       };
 
-      const token = generateToken(payload);
-      const refreshToken = await generateRefreshToken(user.id);
+      const sessionId = uuidv4();
+      const binding = createSessionBinding(req.header("X-Device-ID"), req.get("user-agent"));
+      const token = generateToken(payload, { sessionId, binding });
+      const decodedToken = verifyToken(token);
+      await registerJwtSession(user.id, sessionId, binding, decodedToken.exp ?? Math.floor(Date.now() / 1000) + 3600);
+      const refreshToken = await generateRefreshToken(user.id, undefined, undefined, { sessionId, binding });
       const permissions = await getUserPermissions(user.id);
+
+      // Track successful login for activity analytics (best-effort, non-blocking).
+      void activityTrackingService.trackActivity({
+        userId: user.id,
+        eventType: "user.login",
+        ipAddress: req.ip,
+        userAgent: req.get("user-agent"),
+        metadata: { method: "phone_password" },
+      });
 
       res.json({
         message: "Login successful",
@@ -273,11 +281,21 @@ authRoutes.post("/refresh", async (req: Request, res: Response) => {
     // Verify and check for reuse
     const decoded = await verifyRefreshToken(refreshToken);
     // Issue new access and refresh tokens (rotate)
-    const token = generateToken({ userId: decoded.userId, email: "" }); // You may want to fetch email if needed
+    const token = generateToken(
+      { userId: decoded.userId, email: "" },
+      { sessionId: decoded.sessionId, binding: decoded.binding },
+    );
+    if (decoded.sessionId && decoded.binding) {
+      const decodedToken = verifyToken(token);
+      await registerJwtSession(decoded.userId, decoded.sessionId, decoded.binding, decodedToken.exp ?? Math.floor(Date.now() / 1000) + 3600);
+    }
     const newRefreshToken = await generateRefreshToken(
       decoded.userId,
       decoded.familyId,
       decoded.tokenId,
+      decoded.sessionId && decoded.binding
+        ? { sessionId: decoded.sessionId, binding: decoded.binding }
+        : undefined,
     );
     res.json({
       message: "Token rotation successful",
