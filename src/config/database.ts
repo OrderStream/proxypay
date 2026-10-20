@@ -26,6 +26,21 @@ dbDrMode.set(isDRMode() ? 1 : 0);
 const productionSsl =
   process.env.NODE_ENV === "production" ? { rejectUnauthorized: true } : undefined;
 
+const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS);
+const configuredStatementTimeoutMs = Number(process.env.DB_STATEMENT_TIMEOUT_MS);
+const statementTimeoutMs =
+  Number.isSafeInteger(configuredStatementTimeoutMs) &&
+  configuredStatementTimeoutMs > 0
+    ? configuredStatementTimeoutMs
+    : Math.max(
+        1,
+        Math.floor(
+          (Number.isSafeInteger(requestTimeoutMs) && requestTimeoutMs > 0
+            ? requestTimeoutMs
+            : 30000) * 0.9,
+        ),
+      );
+
 // Configuration for slow query logging
 const SLOW_QUERY_THRESHOLD_MS = parseInt(
   process.env.SLOW_QUERY_THRESHOLD_MS || "1000",
@@ -260,24 +275,10 @@ const DB_POOL_MONITOR_INTERVAL_MS = readPoolNumber(
  */
 export const pool = new Pool({
   connectionString: IS_SANDBOX ? (SANDBOX_DATABASE_URL || DATABASE_URL) : DATABASE_URL,
-  max: DB_POOL_MAX,
-  min: DB_POOL_MIN,
-  idleTimeoutMillis: DB_POOL_IDLE_TIMEOUT_MS,
-  connectionTimeoutMillis: DB_POOL_CONNECTION_TIMEOUT_MS,
-  ssl: productionSsl,
-});
-
-/**
- * Dedicated write connection pool – handles INSERT / UPDATE / DELETE operations.
- * Separating writes from reads lets operators size the two pools independently
- * for their workload (e.g. small writer pool + large reader pool, or vice-versa).
- */
-export const writePool = new Pool({
-  connectionString: IS_SANDBOX ? (SANDBOX_DATABASE_URL || DATABASE_URL) : DATABASE_URL,
-  max: DB_WRITE_POOL_MAX,
-  min: DB_WRITE_POOL_MIN,
-  idleTimeoutMillis: DB_WRITE_POOL_IDLE_TIMEOUT_MS,
-  connectionTimeoutMillis: DB_WRITE_POOL_CONNECTION_TIMEOUT_MS,
+  max: 1000,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 500,
+  statement_timeout: statementTimeoutMs,
   ssl: productionSsl,
 });
 
@@ -392,9 +393,10 @@ const replicaPools: Pool[] = replicaUrls.map(
   (url) =>
     new Pool({
       connectionString: url,
-      max: DB_REPLICA_POOL_MAX,
-      idleTimeoutMillis: DB_REPLICA_POOL_IDLE_TIMEOUT_MS,
-      connectionTimeoutMillis: DB_REPLICA_POOL_CONNECTION_TIMEOUT_MS,
+      max: 50,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 500,
+      statement_timeout: statementTimeoutMs,
       ssl: productionSsl,
     }),
 );

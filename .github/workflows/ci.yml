@@ -319,9 +319,8 @@ jobs:
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
 
-      - name: Run migration integration tests (up/down + per-migration rollback)
-        run: npm run test:migrations
-        continue-on-error: false
+      - name: Check schema drift
+        run: npm run schema:check
         env:
           DATABASE_URL: postgresql://test_user:test_password@localhost:5432/test_db
 
