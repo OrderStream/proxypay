@@ -213,6 +213,35 @@ export function parsePaginationParams(
   };
 }
 
+/**
+ * Pagination params with opaque cursors already decoded into payloads.
+ * Attached to `req.pagination` by the `parsePaginationQuery` middleware.
+ */
+export interface DecodedPaginationParams {
+  limit: number;
+  offset: number;
+  /** Decoded cursor for the next page (rows after the boundary). */
+  after?: CursorPayload;
+  /** Decoded cursor for the previous page (rows before the boundary). */
+  before?: CursorPayload;
+}
+
+/**
+ * Decode the opaque cursors of previously parsed pagination params.
+ *
+ * @throws {PaginationError} when `after` or `before` is malformed.
+ */
+export function decodePaginationCursors(
+  params: PaginationParams,
+): DecodedPaginationParams {
+  return {
+    limit: params.limit,
+    offset: params.offset,
+    after: params.after ? decodeCursor(params.after) : undefined,
+    before: params.before ? decodeCursor(params.before) : undefined,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // SQL predicate builder
 // ---------------------------------------------------------------------------

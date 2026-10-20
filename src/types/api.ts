@@ -200,6 +200,19 @@ export interface ProviderHealthSummary {
   totalCount: number;
 }
 
+export interface DetailedReadinessCheckResponse {
+  status: "ready" | "not ready";
+  timestamp: string;
+  checks: Record<string, string>;
+  components: {
+    database: ComponentHealthMetrics;
+    redis: ComponentHealthMetrics;
+    replication?: ComponentHealthMetrics & {
+      drMode?: string;
+    };
+  };
+}
+
 export interface ReadinessCheckResponse {
   status: "ready" | "not ready";
   checks: Record<string, string>;
@@ -224,4 +237,19 @@ export interface QueueHealthResponse {
 export interface QueueActionResponse {
   success: boolean;
   message: string;
+}
+
+export interface DetailedLBHealthCheckResponse {
+  status: "ok" | "error";
+  timestamp: string;
+  components: {
+    database: ComponentHealthMetrics;
+    redis: ComponentHealthMetrics;
+    memory: ComponentHealthMetrics;
+    providers?: ComponentHealthMetrics & {
+      overall?: "healthy" | "degraded" | "down";
+      providers?: Record<string, "up" | "down" | "unknown">;
+    };
+  };
+  overallStatus: "healthy" | "degraded" | "down";
 }

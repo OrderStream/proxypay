@@ -4,11 +4,18 @@
  * Validates that:
  *  - metadataSchema accepts valid well-formed metadata
  *  - validateMetadataSchema() throws for invalid field types/lengths
- *  - Unknown extra keys are passed through (forward-compatible via .passthrough())
+ *  - Unknown extra keys (top-level and nested) are passed through and retained
+ *    (forward-compatible via .passthrough())
+ *  - validateMetadata() enforces the serialized size cap
  */
 
 import { describe, it, expect } from "@jest/globals";
-import { metadataSchema, validateMetadataSchema } from "../transaction";
+import {
+  metadataSchema,
+  validateMetadataSchema,
+  validateMetadata,
+  MAX_METADATA_BYTES,
+} from "../transaction";
 
 // ── Schema unit tests ─────────────────────────────────────────────────────────
 
@@ -117,5 +124,86 @@ describe("validateMetadataSchema (#645)", () => {
   it("rejects an array at the top level", () => {
     // metadataSchema.safeParse([]) would fail since it expects an object
     expect(() => validateMetadataSchema([{ note: "bad" }])).toThrow();
+  });
+});
+
+// ── Unknown / nested key handling (#645) ──────────────────────────────────────
+
+describe("metadata unknown & nested keys (#645)", () => {
+  it("retains unknown top-level keys through validateMetadataSchema", () => {
+    const result = validateMetadataSchema({
+      note: "ok",
+      customProviderField: "some value",
+    });
+    expect(result.customProviderField).toBe("some value");
+  });
+
+  it("retains unknown keys nested inside the stellar sub-object (passthrough)", () => {
+    const result = metadataSchema.safeParse({
+      stellar: {
+        transactionHash: "abc123",
+        providerDiagnostic: { attempt: 3, detail: "boom" },
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data.stellar as any).providerDiagnostic).toEqual({
+        attempt: 3,
+        detail: "boom",
+      });
+    }
+  });
+
+  it("retains arbitrary keys nested inside reconciliation", () => {
+    const result = metadataSchema.safeParse({
+      reconciliation: { auto_corrected: true, corrected_at: "2024-01-01" },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data.reconciliation as any).auto_corrected).toBe(true);
+    }
+  });
+
+  it("retains deep structures under an unknown top-level key", () => {
+    const result = validateMetadataSchema({
+      xProvider: { nested: { deep: [1, 2, 3] } },
+    });
+    expect(result.xProvider).toEqual({ nested: { deep: [1, 2, 3] } });
+  });
+
+  it("still validates known fields while retaining siblings", () => {
+    expect(() =>
+      validateMetadataSchema({ note: "x".repeat(501), extra: "kept" }),
+    ).toThrow(/note/i);
+  });
+});
+
+// ── Serialized size limit (#645) ──────────────────────────────────────────────
+
+describe("validateMetadata size limit (#645)", () => {
+  it("accepts metadata at the byte cap", () => {
+    // JSON.stringify({ blob }) adds 11 bytes of structural overhead, so this
+    // serializes to exactly MAX_METADATA_BYTES.
+    const blob = "x".repeat(MAX_METADATA_BYTES - 11);
+    expect(Buffer.byteLength(JSON.stringify({ blob }), "utf8")).toBe(
+      MAX_METADATA_BYTES,
+    );
+    expect(() => validateMetadata({ blob })).not.toThrow();
+  });
+
+  it("rejects metadata exceeding the byte cap", () => {
+    const blob = "x".repeat(MAX_METADATA_BYTES);
+    expect(() => validateMetadata({ blob })).toThrow(/exceeds/i);
+  });
+
+  it("returns an empty object for nullish metadata", () => {
+    expect(validateMetadata(undefined)).toEqual({});
+    expect(validateMetadata(null)).toEqual({});
+  });
+
+  it("rejects an array at the top level", () => {
+    expect(() => validateMetadata([{ note: "bad" }])).toThrow(
+      /JSON object/i,
+    );
   });
 });

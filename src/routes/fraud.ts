@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import { FraudAlertModel, FraudAlertFilter, FraudReviewInput } from '../models/fraudAlert';
 import { fraudService } from '../services/fraud';
 import { requireAuth } from '../middleware/auth';
+import { parseRequestPagination } from '../middleware/pagination';
+import { PaginationError } from '../utils/pagination';
 import logger from '../utils/logger';
 
 export const fraudRoutes = Router();
@@ -14,12 +16,16 @@ const fraudAlertModel = new FraudAlertModel();
 fraudRoutes.get('/history/:userId', requireAuth, async (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
-    const { limit = '50', offset = '0' } = req.query;
+
+    const pagination = parseRequestPagination(req, res);
+    if (!pagination) {
+      return;
+    }
 
     const result = await fraudAlertModel.findByUserId(
       userId,
-      parseInt(limit as string),
-      parseInt(offset as string),
+      pagination.limit,
+      pagination.offset,
     );
 
     res.json({
@@ -29,6 +35,10 @@ fraudRoutes.get('/history/:userId', requireAuth, async (req: Request, res: Respo
       hasMore: result.hasMore,
     });
   } catch (error) {
+    if (error instanceof PaginationError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
     logger.error({ err: error }, 'Failed to get fraud history');
     res.status(500).json({ error: 'Failed to retrieve fraud history' });
   }
@@ -40,15 +50,20 @@ fraudRoutes.get('/history/:userId', requireAuth, async (req: Request, res: Respo
  */
 fraudRoutes.get('/alerts', requireAuth, async (req: Request, res: Response) => {
   try {
+    const pagination = parseRequestPagination(req, res);
+    if (!pagination) {
+      return;
+    }
+
     const filter: FraudAlertFilter = {
       status: req.query.status as any,
       userId: req.query.userId as string,
       riskLevel: req.query.riskLevel as any,
       isFalsePositive: req.query.isFalsePositive === 'true' ? true : req.query.isFalsePositive === 'false' ? false : undefined,
-      limit: parseInt(req.query.limit as string) || 50,
-      offset: parseInt(req.query.offset as string) || 0,
-      before: req.query.before as string,
-      after: req.query.after as string,
+      limit: pagination.limit,
+      offset: pagination.offset,
+      before: typeof req.query.before === 'string' ? req.query.before : undefined,
+      after: typeof req.query.after === 'string' ? req.query.after : undefined,
     };
 
     if (req.query.startDate) {
@@ -67,6 +82,10 @@ fraudRoutes.get('/alerts', requireAuth, async (req: Request, res: Response) => {
       hasMore: result.hasMore,
     });
   } catch (error) {
+    if (error instanceof PaginationError) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
     logger.error({ err: error }, 'Failed to list fraud alerts');
     res.status(500).json({ error: 'Failed to list fraud alerts' });
   }
