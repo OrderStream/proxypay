@@ -140,6 +140,13 @@ const JOBS: JobConfig[] = [
     handler: runDailyProviderReconciliation,
   },
   {
+    name: "dispute-sla",
+    // Every hour - monitors dispute SLA compliance, applies auto-escalation rules,
+    // and escalates overdue disputes
+    schedule: process.env.DISPUTE_SLA_CRON || "0 * * * *",
+    handler: runDisputeSlaJob,
+  },
+  {
     name: "monthly-invoice",
     // 1st of every month at midnight
     schedule: "0 0 1 * *",

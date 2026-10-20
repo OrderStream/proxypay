@@ -1,5 +1,10 @@
 import { pool } from "../config/database";
 import {
+  CursorPayload,
+  buildCursorWhere,
+  decodeCursor,
+} from "../utils/pagination";
+import {
   AMLAlert,
   AMLAlertStatus,
   AMLAlertSeverity,
@@ -144,31 +149,14 @@ export class AMLAlertModel {
     const pendingReview = parseInt(pendingResult.rows[0].count, 10);
 
     // Keyset pagination processing
-    let cursorTime: Date | null = null;
-    let cursorId: string | null = null;
+    let cursorPayload: CursorPayload | null = null;
     let isReversed = false;
 
     if (filter.after) {
-      const decoded = Buffer.from(filter.after, "base64").toString("utf8");
-      const [timeStr, idStr] = decoded.split("|");
-      if (timeStr && idStr) {
-        const parsedTime = new Date(timeStr);
-        if (!isNaN(parsedTime.getTime())) {
-          cursorTime = parsedTime;
-          cursorId = idStr;
-        }
-      }
+      cursorPayload = decodeCursor(filter.after);
     } else if (filter.before) {
-      const decoded = Buffer.from(filter.before, "base64").toString("utf8");
-      const [timeStr, idStr] = decoded.split("|");
-      if (timeStr && idStr) {
-        const parsedTime = new Date(timeStr);
-        if (!isNaN(parsedTime.getTime())) {
-          cursorTime = parsedTime;
-          cursorId = idStr;
-          isReversed = true;
-        }
-      }
+      cursorPayload = decodeCursor(filter.before);
+      isReversed = true;
     }
 
     // Build conditions including keyset cursor
@@ -176,25 +164,23 @@ export class AMLAlertModel {
     const alertsParams = [...params];
     let alertsParamIndex = paramIndex;
 
-    if (cursorTime && cursorId) {
-      if (isReversed) {
-        alertsConditions.push(
-          `(created_at > $${alertsParamIndex} OR (created_at = $${alertsParamIndex} AND id > $${alertsParamIndex + 1}))`
-        );
-      } else {
-        alertsConditions.push(
-          `(created_at < $${alertsParamIndex} OR (created_at = $${alertsParamIndex} AND id < $${alertsParamIndex + 1}))`
-        );
-      }
-      alertsParams.push(cursorTime);
-      alertsParams.push(cursorId);
-      alertsParamIndex += 2;
+    if (cursorPayload) {
+      const { clause, params: cursorParams } = buildCursorWhere(cursorPayload, {
+        column: "created_at",
+        idColumn: "id",
+        order: "desc",
+        direction: isReversed ? "backward" : "forward",
+        paramOffset: alertsParamIndex,
+      });
+      alertsConditions.push(clause);
+      alertsParams.push(...cursorParams);
+      alertsParamIndex += cursorParams.length;
     }
 
     const alertsWhereClause =
       alertsConditions.length > 0 ? `WHERE ${alertsConditions.join(" AND ")}` : "";
 
-    const limit = filter.limit ?? 50;
+    const limit = Math.min(Math.max(filter.limit ?? 50, 1), 100);
     const isCursorPagination = !!(filter.before || filter.after);
     const sortOrder = isReversed ? "ASC" : "DESC";
 

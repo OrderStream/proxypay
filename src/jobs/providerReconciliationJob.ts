@@ -74,11 +74,13 @@ export async function runDailyProviderReconciliation(): Promise<void> {
     if (criticalAlerts.length > 0 || highAlerts.length > 0) {
       logger.warn(`[Daily Provider Reconciliation] Found ${criticalAlerts.length} critical and ${highAlerts.length} high priority alerts requiring review`);
 
-      // TODO: Add notification logic (email, Slack, PagerDuty, etc.)
-      // For now, log detailed alert information
       for (const alert of [...criticalAlerts, ...highAlerts]) {
         logger.warn(`[Alert] ${alert.alert_type} (${alert.severity}) - Ref: ${alert.reference_number}, Transaction: ${alert.transaction_id}`);
       }
+
+      // Dispatch notifications across PagerDuty, Slack, and email
+      const { reconciliationAlertNotifier } = await import("../services/reconciliationAlertNotifier.js");
+      await reconciliationAlertNotifier.notifyAlerts([...criticalAlerts, ...highAlerts]);
     }
 
     // Check for unreconciled transactions that may need attention

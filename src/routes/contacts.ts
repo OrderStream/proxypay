@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { z } from "zod";
 import { ContactModel } from "../models/contact";
 import { authenticateToken } from "../middleware/auth";
+import { parsePaginationQuery } from "../middleware/pagination";
 import { TimeoutPresets, haltOnTimedout } from "../middleware/timeout";
 import { ERROR_CODES } from "../constants/errorCodes";
 import { createError } from "../middleware/errorHandler";
@@ -156,6 +157,7 @@ contactsRoutes.get(
   "/",
   TimeoutPresets.quick,
   haltOnTimedout,
+  parsePaginationQuery(),
   async (req: Request, res: Response) => {
     const userId = getUserId(req);
     if (!userId) {
@@ -169,10 +171,13 @@ contactsRoutes.get(
     }
 
     try {
-      const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
-      const cursor = typeof req.query.cursor === "string" ? req.query.cursor : undefined;
+      const { limit, after } = req.pagination ?? { limit: 50 };
       const search = typeof req.query.search === "string" ? req.query.search : undefined;
-      const { contacts, nextCursor } = await contactModel.listByUser(userId, { limit, cursor, search });
+      const { contacts, nextCursor } = await contactModel.listByUser(userId, {
+        limit,
+        cursor: after,
+        search,
+      });
       return res.json({ contacts, nextCursor });
     } catch (error) {
       console.error("List contacts error:", error);

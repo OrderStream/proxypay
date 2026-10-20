@@ -63,7 +63,8 @@ import {
   haltOnTimedout,
   timeoutErrorHandler,
 } from "./middleware/timeout";
-import { requireAuth } from "./middleware/auth";
+import { requireAuth, verifyTokenStateful } from "./middleware/auth";
+import { isAccountActive } from "./middleware/checkAccountStatus";
 import { responseTime } from "./middleware/responseTime";
 import { requestId } from "./middleware/requestId";
 import { idempotency } from "./middleware/idempotency";
@@ -77,11 +78,18 @@ import {
   HealthCheckResponse,
   ReadinessCheckResponse,
   ProviderHealthSummary,
+  DetailedHealthCheckResponse,
+  DetailedReadinessCheckResponse,
+  DetailedLBHealthCheckResponse,
 } from "./types/api";
 import {
   checkMobileMoneyHealth,
   ProviderName,
 } from "./services/mobilemoney/providers/healthCheck";
+import {
+  getDetailedComponentHealth,
+  determineOverallStatus,
+} from "./services/componentHealthService";
 import { privacyRoutes } from "./routes/privacy";
 import { developerDashboardRoutes } from "./routes/developerDashboard";
 import { travelRuleRoutes } from "./routes/travelRule";
@@ -304,68 +312,110 @@ async function getProviderHealthSummary(): Promise<ProviderHealthSummary> {
 }
 
 app.get("/health", async (_req: Request, res: Response) => {
-  const providerHealth = await getProviderHealthSummary();
-  const body: HealthCheckResponse = {
-    status: "ok",
-    timestamp: new Date().toISOString(),
-    gitHash: process.env.BUILD_HASH,
-    providers: providerHealth,
-  };
-  res.json(body);
+  try {
+    const components = await getDetailedComponentHealth();
+    const overallStatus = determineOverallStatus(components);
+
+    const body: DetailedHealthCheckResponse = {
+      status: overallStatus === "down" ? "error" : overallStatus === "degraded" ? "degraded" : "ok",
+      timestamp: new Date().toISOString(),
+      gitHash: process.env.BUILD_HASH,
+      components: {
+        database: components.database,
+        redis: components.redis,
+        providers: components.providers,
+      },
+      overallStatus,
+    };
+    res.status(body.status === "error" ? 503 : 200).json(body);
+  } catch (err) {
+    console.error("Health check failed", err);
+    res.status(503).json({
+      status: "error",
+      timestamp: new Date().toISOString(),
+      overallStatus: "down",
+      components: {
+        database: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+        redis: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+        providers: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+      },
+    });
+  }
 });
 
 app.get("/ready", async (_req: Request, res: Response) => {
-  const checks: Record<string, string> = {
-    database: "down",
-    redis: "down",
-    shutdown: isShuttingDown ? "in-progress" : "idle",
-  };
-  let allReady = true;
-
-  if (isShuttingDown) {
-    allReady = false;
-  }
-
   try {
-    await pool.query("SELECT 1");
-    checks.database = "ok";
-  } catch (err) {
-    console.error("Database check failed", err);
-    allReady = false;
-  }
+    const components = await getDetailedComponentHealth();
+    
+    const checks: Record<string, string> = {
+      database: components.database.status,
+      redis: components.redis.status,
+      replication: components.replication?.status || "unknown",
+      shutdown: isShuttingDown ? "in-progress" : "idle",
+    };
 
-  try {
-    if (redisClient?.isOpen) {
-      await redisClient.ping();
-      checks.redis = "ok";
-    } else {
-      checks.redis = "closed";
-      allReady = false;
+    if (components.replication?.drMode) {
+      checks.dr_mode = components.replication.drMode;
     }
-  } catch (err) {
-    console.error("Redis check failed", err);
-    allReady = false;
-  }
 
-  // Replication status is informational: a lagging or down replica degrades
-  // the replication check but reads fall back to the primary, so it does not
-  // flip the pod to not-ready (that would defeat DR redundancy).
-  try {
-    const replication = await getReplicationStatus();
-    checks.replication = replication.status;
-    checks.dr_mode = replication.drMode;
-  } catch (err) {
-    console.error("Replication check failed", err);
-    checks.replication = "unknown";
-    checks.dr_mode = "standby";
-  }
+    // Critical components must be healthy for readiness
+    const isCriticalHealthy =
+      components.database.status !== "down" &&
+      components.redis.status !== "down" &&
+      !isShuttingDown;
 
-  const body: ReadinessCheckResponse = {
-    status: allReady ? "ready" : "not ready",
-    checks,
-    timestamp: new Date().toISOString(),
-  };
-  res.status(allReady ? 200 : 503).json(body);
+    const body: DetailedReadinessCheckResponse = {
+      status: isCriticalHealthy ? "ready" : "not ready",
+      timestamp: new Date().toISOString(),
+      checks,
+      components: {
+        database: components.database,
+        redis: components.redis,
+        replication: components.replication,
+      },
+    };
+    res.status(isCriticalHealthy ? 200 : 503).json(body);
+  } catch (err) {
+    console.error("Readiness check failed", err);
+    res.status(503).json({
+      status: "not ready",
+      timestamp: new Date().toISOString(),
+      checks: {
+        database: "error",
+        redis: "error",
+        shutdown: "unknown",
+      },
+      components: {
+        database: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Readiness check failed",
+        },
+        redis: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Readiness check failed",
+        },
+      },
+    });
+  }
 });
 
 app.get("/admin/dashboard", (_req: Request, res: Response) => {
@@ -380,71 +430,77 @@ app.get("/health/lb", async (req: Request, res: Response) => {
   const now = Date.now();
   if (lbHealthCache && now - lbHealthCache.timestamp < LB_HEALTH_CACHE_TTL) {
     res
-      .status(lbHealthCache.data.status === "ok" ? 200 : 503)
+      .status(lbHealthCache.data.overallStatus === "healthy" ? 200 : 503)
       .json(lbHealthCache.data);
     return;
   }
 
-  const checks: Record<string, string> = {
-    database: "down",
-    redis: "down",
-    memory: "ok",
-  };
-  let healthy = true;
-
-  if (isShuttingDown) {
-    healthy = false;
-  }
-
   try {
-    await pool.query("SELECT 1");
-    checks.database = "ok";
+    const components = await getDetailedComponentHealth();
+    const overallStatus = determineOverallStatus(components);
+
+    // Critical for LB: database and redis must not be down
+    const isLBHealthy = components.database.status !== "down" && 
+                        components.redis.status !== "down" && 
+                        !isShuttingDown;
+
+    const body: DetailedLBHealthCheckResponse = {
+      status: isLBHealthy ? "ok" : "error",
+      timestamp: new Date().toISOString(),
+      components: {
+        database: components.database,
+        redis: components.redis,
+        memory: components.memory!,
+        providers: {
+          status: components.providers.status,
+          responseTime: components.providers.responseTime,
+          lastChecked: components.providers.lastChecked,
+          error: components.providers.error,
+          overall: components.providers.status,
+          providers: components.providers.providers,
+        },
+      },
+      overallStatus,
+    };
+
+    lbHealthCache = { data: body, timestamp: now };
+    res.status(isLBHealthy ? 200 : 503).json(body);
   } catch (err) {
-    healthy = false;
+    console.error("Load balancer health check failed", err);
+    const errorResponse: DetailedLBHealthCheckResponse = {
+      status: "error",
+      timestamp: new Date().toISOString(),
+      components: {
+        database: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+        redis: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+        memory: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+        providers: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+      },
+      overallStatus: "down",
+    };
+    lbHealthCache = { data: errorResponse, timestamp: now };
+    res.status(503).json(errorResponse);
   }
-
-  try {
-    if (redisClient?.isOpen) {
-      await redisClient.ping();
-      checks.redis = "ok";
-    } else {
-      checks.redis = "closed";
-      healthy = false;
-    }
-  } catch (err) {
-    healthy = false;
-  }
-
-  // Check provider health
-  try {
-    const providerHealth = await getProviderHealthSummary();
-    checks.providers = providerHealth.overall;
-    if (providerHealth.overall === "down") {
-      healthy = false;
-    } else if (providerHealth.overall === "degraded") {
-      // Don't mark as unhealthy, but track it
-      checks.providersDetail = JSON.stringify(providerHealth.providers);
-    }
-  } catch (err) {
-    console.error("Provider health check failed", err);
-    checks.providers = "error";
-  }
-
-  const memUsage = process.memoryUsage();
-  if (memUsage.heapUsed > 1024 * 1024 * 1024) {
-    // 1GB limit
-    checks.memory = "high";
-    healthy = false;
-  }
-
-  const responseData = {
-    status: healthy ? "ok" : "error",
-    checks,
-    timestamp: new Date().toISOString(),
-  };
-
-  lbHealthCache = { data: responseData, timestamp: now };
-  res.status(healthy ? 200 : 503).json(responseData);
 });
 
 app.use(globalTimeout);
@@ -616,6 +672,116 @@ if (process.env.SENTRY_DSN) {
 app.use(timeoutErrorHandler);
 app.use(errorHandler);
 
+export interface ShutdownDependencies {
+  server?: { close: (cb: (err?: any) => void) => void; closeAllConnections?: () => void } | null;
+  wsManager?: { close: () => Promise<void> } | null;
+  requestTracker?: { activeCount: number; waitForZero: (timeoutMs: number) => Promise<void> };
+  stopWorkers?: () => Promise<void>;
+  shutdownQueue?: () => Promise<void>;
+  stopHeartbeat?: () => void;
+  closeDbPool?: () => Promise<void>;
+  disconnectRedis?: () => Promise<void>;
+  graphqlCleanup?: { dispose: () => Promise<void> } | null;
+}
+
+export async function executeGracefulShutdown(
+  deps: ShutdownDependencies,
+  timeoutMs: number = SHUTDOWN_TIMEOUT_MS,
+  stepTimeoutMs: number = 5000
+): Promise<{ success: boolean; closedSteps: string[]; errors: Array<{ step: string; error: string }> }> {
+  const closedSteps: string[] = [];
+  const errors: Array<{ step: string; error: string }> = [];
+
+  const runBoundedStep = async (stepName: string, fn: () => Promise<void> | void): Promise<void> => {
+    let timer: NodeJS.Timeout | null = null;
+    try {
+      console.log(`[Shutdown] Starting: ${stepName}`);
+      await Promise.race([
+        Promise.resolve(fn()),
+        new Promise<void>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`Timeout after ${stepTimeoutMs}ms`)), stepTimeoutMs);
+        }),
+      ]);
+      closedSteps.push(stepName);
+      console.log(`[Shutdown] Completed: ${stepName}`);
+    } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      errors.push({ step: stepName, error: errMsg });
+      console.warn(`[Shutdown] Step '${stepName}' failed or timed out: ${errMsg}`);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  // Step 1: Stop HTTP server from accepting new requests
+  if (deps.server) {
+    await runBoundedStep("stop_http_listener", () => {
+      return new Promise<void>((resolve) => {
+        deps.server!.close((error) => {
+          if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") {
+            console.error("[Shutdown] HTTP listener close error:", error);
+          }
+          resolve();
+        });
+      });
+    });
+  }
+
+  // Step 2: Drain in-flight active HTTP requests
+  if (deps.requestTracker) {
+    await runBoundedStep("drain_active_requests", async () => {
+      const active = deps.requestTracker!.activeCount;
+      if (active > 0) {
+        console.log(`[Shutdown] Waiting for ${active} active request(s) to finish (timeout ${timeoutMs}ms)`);
+      }
+      await deps.requestTracker!.waitForZero(timeoutMs);
+      if (deps.requestTracker!.activeCount > 0) {
+        console.warn(`[Shutdown] Timed out waiting for active requests. Remaining: ${deps.requestTracker!.activeCount}`);
+        deps.server?.closeAllConnections?.();
+      }
+    });
+  }
+
+  // Step 3: Stop background workers
+  if (deps.stopWorkers) {
+    await runBoundedStep("stop_background_workers", deps.stopWorkers);
+  }
+
+  // Step 4: Drain and stop background queue resources
+  if (deps.shutdownQueue) {
+    await runBoundedStep("stop_queues", deps.shutdownQueue);
+  }
+
+  // Step 5: Stop heartbeat and monitoring services
+  if (deps.stopHeartbeat) {
+    await runBoundedStep("stop_heartbeat", deps.stopHeartbeat);
+  }
+
+  // Step 6: Close WebSocket and GraphQL connection managers
+  if (deps.wsManager) {
+    await runBoundedStep("close_websocket_manager", async () => {
+      await deps.wsManager!.close();
+    });
+  }
+  if (deps.graphqlCleanup) {
+    await runBoundedStep("close_graphql_cleanup", async () => {
+      await deps.graphqlCleanup!.dispose();
+    });
+  }
+
+  // Step 7: Close Redis client connections
+  if (deps.disconnectRedis) {
+    await runBoundedStep("disconnect_redis", deps.disconnectRedis);
+  }
+
+  // Step 8: Close PostgreSQL connection pool
+  if (deps.closeDbPool) {
+    await runBoundedStep("close_db_pool", deps.closeDbPool);
+  }
+
+  return { success: errors.length === 0, closedSteps, errors };
+}
+
 async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
   if (shutdownInProgress) {
     console.log(`[Shutdown] ${signal} received; shutdown already in progress`);
@@ -627,79 +793,47 @@ async function gracefulShutdown(signal: NodeJS.Signals): Promise<void> {
   console.log(`[Shutdown] Received ${signal}. Starting graceful shutdown...`);
 
   try {
-    if (server) {
-      console.log(
-        "[Shutdown] Stopping HTTP server from accepting new requests",
-      );
-      // Initiate listener closure before cleaning up dependencies so no new
-      // work can enter while the existing requests drain.
-      server.close((error) => {
-        if (
-          error &&
-          (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING"
-        ) {
-          console.error("[Shutdown] HTTP listener close failed", error);
-          return;
-        }
-        console.log("[Shutdown] HTTP listener closed");
-      });
-    }
+    const { stopNotificationWorker } = await import("./workers/notificationWorker.js").catch(() => ({
+      stopNotificationWorker: async () => {},
+    }));
+    const { shutdownQueue } = await import("./queue/index.js").catch(() => ({
+      shutdownQueue: async () => {},
+    }));
 
-    if (wsManager) {
-      console.log("[Shutdown] Closing WebSocket connections");
-      await wsManager.close();
-      wsManager = null;
-      console.log("[Shutdown] WebSocket connections closed");
-    }
+    const result = await executeGracefulShutdown(
+      {
+        server,
+        wsManager,
+        requestTracker,
+        stopWorkers: async () => {
+          await stopNotificationWorker();
+        },
+        shutdownQueue,
+        stopHeartbeat: () => {
+          stopHeartbeatService();
+        },
+        closeDbPool: async () => {
+          await pool.end();
+        },
+        disconnectRedis: async () => {
+          await disconnectRedis();
+        },
+        graphqlCleanup: graphqlServerCleanup,
+      },
+      SHUTDOWN_TIMEOUT_MS,
+      5000
+    );
 
-    const pendingAtStart = requestTracker.activeCount;
-    if (pendingAtStart > 0) {
-      console.log(
-        `[Shutdown] Waiting for ${pendingAtStart} active request(s) to finish (timeout ${SHUTDOWN_TIMEOUT_MS}ms)`,
-      );
-    }
+    wsManager = null;
+    graphqlServerCleanup = null;
 
-    await requestTracker.waitForZero(SHUTDOWN_TIMEOUT_MS);
-
-    if (requestTracker.activeCount > 0) {
-      console.warn(
-        `[Shutdown] Timed out waiting for active requests. Remaining: ${requestTracker.activeCount}`,
-      );
-      server?.closeAllConnections?.();
+    if (result.success) {
+      console.log("[Shutdown] Graceful shutdown completed cleanly");
+      process.exit(0);
     } else {
-      console.log("[Shutdown] All active requests finished");
+      console.warn(`[Shutdown] Graceful shutdown finished with ${result.errors.length} warning(s)`);
+      process.exit(0);
     }
-
-    console.log("[Shutdown] Draining queue resources");
-    const { shutdownQueue } = await import("./queue/index.js");
-    await shutdownQueue();
-    console.log("[Shutdown] Queue resources closed");
-
-    console.log("[Shutdown] Stopping heartbeat service");
-    stopHeartbeatService();
-    console.log("[Shutdown] Heartbeat service stopped");
-
-    console.log("[Shutdown] Closing PostgreSQL pool");
-    await pool.end();
-    console.log("[Shutdown] PostgreSQL pool closed");
-
-    console.log("[Shutdown] Closing Redis client");
-    await disconnectRedis();
-    console.log("[Shutdown] Redis client closed");
-
-    console.log("[Shutdown] Closing WebSocket servers");
-    if (wsManager) {
-      await wsManager.close();
-      wsManager = null;
-    }
-    if (graphqlServerCleanup) {
-      await graphqlServerCleanup.dispose();
-      graphqlServerCleanup = null;
-    }
-    console.log("[Shutdown] WebSocket servers closed");
-
-    console.log("[Shutdown] Graceful shutdown complete");
-    process.exit(0);
   } catch (error) {
     console.error("[Shutdown] Shutdown sequence failed", error);
     process.exit(1);
@@ -806,7 +940,17 @@ async function initializeRuntime(): Promise<void> {
       console.log(`HTTP/1.1 server running on http://localhost:${PORT}`);
     });
 
-    wsManager = new WebSocketManager(server);
+    wsManager = new WebSocketManager(server, {
+      // Issue #814: revalidate credentials and account status at handshake
+      // time (stateful Redis check + frozen/suspended/deactivated rejection).
+      verifyConnection: async (token) => {
+        const claims = await verifyTokenStateful(token);
+        if (claims.userId && !(await isAccountActive(claims.userId))) {
+          throw new Error("Account is not active");
+        }
+        return claims;
+      },
+    });
     console.log("WebSocket server attached");
 
     // Start Apollo Server with APQ enabled (must run after HTTP server is created)
