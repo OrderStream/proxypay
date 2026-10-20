@@ -174,6 +174,32 @@ export interface LimitExceededErrorResponse extends ErrorResponse {
 // Health
 // ---------------------------------------------------------------------------
 
+// Component Health Status
+export type ComponentStatus = "healthy" | "degraded" | "down";
+
+export interface ComponentHealthMetrics {
+  status: ComponentStatus;
+  responseTime: number; // milliseconds
+  lastChecked: string; // ISO 8601 timestamp
+  error?: string; // Error message if unhealthy
+}
+
+export interface DetailedHealthCheckResponse {
+  status: "ok" | "degraded" | "error";
+  timestamp: string;
+  gitHash?: string;
+  components: {
+    database: ComponentHealthMetrics;
+    redis: ComponentHealthMetrics;
+    providers: ComponentHealthMetrics & {
+      providers?: Record<string, "up" | "down" | "unknown">;
+      healthyCount?: number;
+      totalCount?: number;
+    };
+  };
+  overallStatus: "healthy" | "degraded" | "down";
+}
+
 export interface HealthCheckResponse {
   status: "ok";
   timestamp: string;
@@ -186,6 +212,19 @@ export interface ProviderHealthSummary {
   providers: Record<string, "up" | "down" | "unknown">;
   healthyCount: number;
   totalCount: number;
+}
+
+export interface DetailedReadinessCheckResponse {
+  status: "ready" | "not ready";
+  timestamp: string;
+  checks: Record<string, string>;
+  components: {
+    database: ComponentHealthMetrics;
+    redis: ComponentHealthMetrics;
+    replication?: ComponentHealthMetrics & {
+      drMode?: string;
+    };
+  };
 }
 
 export interface ReadinessCheckResponse {
@@ -212,4 +251,19 @@ export interface QueueHealthResponse {
 export interface QueueActionResponse {
   success: boolean;
   message: string;
+}
+
+export interface DetailedLBHealthCheckResponse {
+  status: "ok" | "error";
+  timestamp: string;
+  components: {
+    database: ComponentHealthMetrics;
+    redis: ComponentHealthMetrics;
+    memory: ComponentHealthMetrics;
+    providers?: ComponentHealthMetrics & {
+      overall?: "healthy" | "degraded" | "down";
+      providers?: Record<string, "up" | "down" | "unknown">;
+    };
+  };
+  overallStatus: "healthy" | "degraded" | "down";
 }

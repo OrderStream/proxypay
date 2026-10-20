@@ -77,11 +77,18 @@ import {
   HealthCheckResponse,
   ReadinessCheckResponse,
   ProviderHealthSummary,
+  DetailedHealthCheckResponse,
+  DetailedReadinessCheckResponse,
+  DetailedLBHealthCheckResponse,
 } from "./types/api";
 import {
   checkMobileMoneyHealth,
   ProviderName,
 } from "./services/mobilemoney/providers/healthCheck";
+import {
+  getDetailedComponentHealth,
+  determineOverallStatus,
+} from "./services/componentHealthService";
 import { privacyRoutes } from "./routes/privacy";
 import { developerDashboardRoutes } from "./routes/developerDashboard";
 import { travelRuleRoutes } from "./routes/travelRule";
@@ -304,68 +311,110 @@ async function getProviderHealthSummary(): Promise<ProviderHealthSummary> {
 }
 
 app.get("/health", async (_req: Request, res: Response) => {
-  const providerHealth = await getProviderHealthSummary();
-  const body: HealthCheckResponse = {
-    status: "ok",
-    timestamp: new Date().toISOString(),
-    gitHash: process.env.BUILD_HASH,
-    providers: providerHealth,
-  };
-  res.json(body);
+  try {
+    const components = await getDetailedComponentHealth();
+    const overallStatus = determineOverallStatus(components);
+
+    const body: DetailedHealthCheckResponse = {
+      status: overallStatus === "down" ? "error" : overallStatus === "degraded" ? "degraded" : "ok",
+      timestamp: new Date().toISOString(),
+      gitHash: process.env.BUILD_HASH,
+      components: {
+        database: components.database,
+        redis: components.redis,
+        providers: components.providers,
+      },
+      overallStatus,
+    };
+    res.status(body.status === "error" ? 503 : 200).json(body);
+  } catch (err) {
+    console.error("Health check failed", err);
+    res.status(503).json({
+      status: "error",
+      timestamp: new Date().toISOString(),
+      overallStatus: "down",
+      components: {
+        database: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+        redis: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+        providers: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+      },
+    });
+  }
 });
 
 app.get("/ready", async (_req: Request, res: Response) => {
-  const checks: Record<string, string> = {
-    database: "down",
-    redis: "down",
-    shutdown: isShuttingDown ? "in-progress" : "idle",
-  };
-  let allReady = true;
-
-  if (isShuttingDown) {
-    allReady = false;
-  }
-
   try {
-    await pool.query("SELECT 1");
-    checks.database = "ok";
-  } catch (err) {
-    console.error("Database check failed", err);
-    allReady = false;
-  }
+    const components = await getDetailedComponentHealth();
+    
+    const checks: Record<string, string> = {
+      database: components.database.status,
+      redis: components.redis.status,
+      replication: components.replication?.status || "unknown",
+      shutdown: isShuttingDown ? "in-progress" : "idle",
+    };
 
-  try {
-    if (redisClient?.isOpen) {
-      await redisClient.ping();
-      checks.redis = "ok";
-    } else {
-      checks.redis = "closed";
-      allReady = false;
+    if (components.replication?.drMode) {
+      checks.dr_mode = components.replication.drMode;
     }
-  } catch (err) {
-    console.error("Redis check failed", err);
-    allReady = false;
-  }
 
-  // Replication status is informational: a lagging or down replica degrades
-  // the replication check but reads fall back to the primary, so it does not
-  // flip the pod to not-ready (that would defeat DR redundancy).
-  try {
-    const replication = await getReplicationStatus();
-    checks.replication = replication.status;
-    checks.dr_mode = replication.drMode;
-  } catch (err) {
-    console.error("Replication check failed", err);
-    checks.replication = "unknown";
-    checks.dr_mode = "standby";
-  }
+    // Critical components must be healthy for readiness
+    const isCriticalHealthy =
+      components.database.status !== "down" &&
+      components.redis.status !== "down" &&
+      !isShuttingDown;
 
-  const body: ReadinessCheckResponse = {
-    status: allReady ? "ready" : "not ready",
-    checks,
-    timestamp: new Date().toISOString(),
-  };
-  res.status(allReady ? 200 : 503).json(body);
+    const body: DetailedReadinessCheckResponse = {
+      status: isCriticalHealthy ? "ready" : "not ready",
+      timestamp: new Date().toISOString(),
+      checks,
+      components: {
+        database: components.database,
+        redis: components.redis,
+        replication: components.replication,
+      },
+    };
+    res.status(isCriticalHealthy ? 200 : 503).json(body);
+  } catch (err) {
+    console.error("Readiness check failed", err);
+    res.status(503).json({
+      status: "not ready",
+      timestamp: new Date().toISOString(),
+      checks: {
+        database: "error",
+        redis: "error",
+        shutdown: "unknown",
+      },
+      components: {
+        database: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Readiness check failed",
+        },
+        redis: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Readiness check failed",
+        },
+      },
+    });
+  }
 });
 
 app.get("/admin/dashboard", (_req: Request, res: Response) => {
@@ -380,71 +429,77 @@ app.get("/health/lb", async (req: Request, res: Response) => {
   const now = Date.now();
   if (lbHealthCache && now - lbHealthCache.timestamp < LB_HEALTH_CACHE_TTL) {
     res
-      .status(lbHealthCache.data.status === "ok" ? 200 : 503)
+      .status(lbHealthCache.data.overallStatus === "healthy" ? 200 : 503)
       .json(lbHealthCache.data);
     return;
   }
 
-  const checks: Record<string, string> = {
-    database: "down",
-    redis: "down",
-    memory: "ok",
-  };
-  let healthy = true;
-
-  if (isShuttingDown) {
-    healthy = false;
-  }
-
   try {
-    await pool.query("SELECT 1");
-    checks.database = "ok";
+    const components = await getDetailedComponentHealth();
+    const overallStatus = determineOverallStatus(components);
+
+    // Critical for LB: database and redis must not be down
+    const isLBHealthy = components.database.status !== "down" && 
+                        components.redis.status !== "down" && 
+                        !isShuttingDown;
+
+    const body: DetailedLBHealthCheckResponse = {
+      status: isLBHealthy ? "ok" : "error",
+      timestamp: new Date().toISOString(),
+      components: {
+        database: components.database,
+        redis: components.redis,
+        memory: components.memory!,
+        providers: {
+          status: components.providers.status,
+          responseTime: components.providers.responseTime,
+          lastChecked: components.providers.lastChecked,
+          error: components.providers.error,
+          overall: components.providers.status,
+          providers: components.providers.providers,
+        },
+      },
+      overallStatus,
+    };
+
+    lbHealthCache = { data: body, timestamp: now };
+    res.status(isLBHealthy ? 200 : 503).json(body);
   } catch (err) {
-    healthy = false;
+    console.error("Load balancer health check failed", err);
+    const errorResponse: DetailedLBHealthCheckResponse = {
+      status: "error",
+      timestamp: new Date().toISOString(),
+      components: {
+        database: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+        redis: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+        memory: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+        providers: {
+          status: "down",
+          responseTime: 0,
+          lastChecked: new Date().toISOString(),
+          error: "Health check failed",
+        },
+      },
+      overallStatus: "down",
+    };
+    lbHealthCache = { data: errorResponse, timestamp: now };
+    res.status(503).json(errorResponse);
   }
-
-  try {
-    if (redisClient?.isOpen) {
-      await redisClient.ping();
-      checks.redis = "ok";
-    } else {
-      checks.redis = "closed";
-      healthy = false;
-    }
-  } catch (err) {
-    healthy = false;
-  }
-
-  // Check provider health
-  try {
-    const providerHealth = await getProviderHealthSummary();
-    checks.providers = providerHealth.overall;
-    if (providerHealth.overall === "down") {
-      healthy = false;
-    } else if (providerHealth.overall === "degraded") {
-      // Don't mark as unhealthy, but track it
-      checks.providersDetail = JSON.stringify(providerHealth.providers);
-    }
-  } catch (err) {
-    console.error("Provider health check failed", err);
-    checks.providers = "error";
-  }
-
-  const memUsage = process.memoryUsage();
-  if (memUsage.heapUsed > 1024 * 1024 * 1024) {
-    // 1GB limit
-    checks.memory = "high";
-    healthy = false;
-  }
-
-  const responseData = {
-    status: healthy ? "ok" : "error",
-    checks,
-    timestamp: new Date().toISOString(),
-  };
-
-  lbHealthCache = { data: responseData, timestamp: now };
-  res.status(healthy ? 200 : 503).json(responseData);
 });
 
 app.use(globalTimeout);
