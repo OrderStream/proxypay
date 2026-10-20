@@ -311,4 +311,38 @@ export async function deactivateUserAccount(userId: string, dbPool?: Pool) {
 
     // 5. Archive transaction history (optional: 
 
-/* … truncated 3078 chars — edit only what you need near the top … */
+export async function invalidateUserOnPasswordChange(userId: string): Promise<void> {
+  const userModel = new UserModel();
+  
+  // 1. Increment DB token version (persisted invalidation)
+  try {
+    await userModel.incrementTokenVersion(userId);
+  } catch (error: any) {
+    // Graceful fallback: Ignore missing column error if the DB migration hasn't run yet
+    if (error.code !== '42703') throw error; 
+  }
+
+  // 2. Revoke all refresh token families
+  try {
+    await pool.query(`UPDATE refresh_token_families SET is_revoked = true WHERE user_id = $1`, [userId]);
+  } catch (error) {
+    console.error("Failed to revoke refresh tokens:", error);
+  }
+
+  // 3. Flush Redis express-sessions and flag active stateless JWTs
+  await flushUserSessions(userId);
+}
+
+/**
+ * Revokes active sessions for a user after a non-active status change
+ * (freeze/suspend/deactivate) so open WebSockets and GraphQL subscriptions are
+ * terminated immediately (issue #814). `flushUserSessions` also publishes the
+ * cross-instance `ws.auth.revoked` event.
+ */
+export async function revokeUserSessionsOnStatusChange(
+  userId: string,
+  status: string,
+): Promise<void> {
+  if (status === "active") return;
+  await flushUserSessions(userId);
+}
